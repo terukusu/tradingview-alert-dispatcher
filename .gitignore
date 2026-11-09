@@ -7,3 +7,10 @@ config.json
 .claude/settings.local.json
 .claude/handoff/
 .claude/worktrees/
+# Terraform（state・plan・変数の実物は置かない。lock はコミットする）
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example

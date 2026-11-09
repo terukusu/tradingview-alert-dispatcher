@@ -1,6 +1,6 @@
 # tradingview-alert-dispatcher
 
-TradingView のアラート（webhook）を受けて、**1 つのアラートを複数の経路に送る** 中継サーバー。第一弾の経路は LINE（Messaging API のチャネルアクセストークン）。動かす先は GCP（Cloud Run の予定）。設計は `docs/design.md`（あれば。決定事項と判断待ちが正）。
+TradingView のアラート（webhook）を受けて、**1 つのアラートを複数の経路に送る** 中継サーバー。第一弾の経路は LINE（Messaging API のチャネルアクセストークン）。動かす先は GCP（Cloud Run の予定）。設計は `docs/design.md`（決定事項の正）。
 
 ## 作り
 
@@ -12,12 +12,16 @@ TradingView のアラート（webhook）を受けて、**1 つのアラートを
 - `src/config.ts`: シークレット・トークンは **環境変数だけ**（`WEBHOOK_SECRET`・`LINE_CHANNEL_ACCESS_TOKEN` など）。送り先は `CONFIG_PATH`（既定 `config.json`、gitignore）の JSON。ファイルが無ければ環境変数（`LINE_TO`）だけで LINE の 1 チャネルを作る。例は `config.example.json`・`.env.example`
 - `Dockerfile`・`.dockerignore`: `node:24.x.y-slim` をタグと digest で固定し、`package.json` と `src/` だけを `/app` に入れる（`.dockerignore` は許可リスト。実行時の依存が無いので依存のインストールもしない）。非 root（`USER node`）、exec 形式の `CMD` で node が SIGTERM を直接受ける。`.github/scripts/image-check.sh <image>` がイメージを検査する（非 root・`/app` の中身・`dependencies` なし・`/health` 200・未認証 401・`docker stop` で終了コード 0。架空の値で起動し、認証の通るリクエストは送らない）
 - `test/`: vitest。経路のテストは偽の `fetch` で行い、**実際の LINE API を呼ばない**。HTTP はポート 0 で立てて確かめる
+- `infra/`: 本番の Terraform（手順は `infra/README.md`）
+  - `bootstrap/`: WIF のプール・プロバイダ、SA 3 つ（実行用・CI の apply 用・plan 用）と追加型の付与、Artifact Registry、tfstate のバケット 2 つ、Secret Manager の入れ物 3 つ（値は持たない）。**所有者が手元で apply**（CI は apply しない）。プロジェクト ID・リポジトリ名・GitHub の数値 ID は `TF_VAR_*` で渡す。`tests/*.tftest.hcl` はモックのプロバイダの `terraform test`（値は架空）
+  - `prod/`: Cloud Run のサービス（#4 で追加。`deploy.yml` が Environment `prod` の承認の後に apply）
 
 ## 開発
 
 - Node は 24（`.node-version`）。TypeScript は Node の型の除去でそのまま動かす（ビルドなし。`import` は `.ts` の拡張子つき、enum・引数プロパティなど消せない構文は使わない = `erasableSyntaxOnly`）。依存はバージョン固定（`package-lock.json` をコミット）。実行時の依存は足さない方針（足すなら Issue で理由を書く）
 - 手元の Node が 24 でなければ `mise exec node@24 -- <コマンド>`
 - 確認: `npm ci && npm run typecheck && npm run lint && npm test && .github/scripts/repo-values-check.test.sh && docker build -t dispatcher:ci . && .github/scripts/image-check.sh dispatcher:ci`（CI と同じ。lint は Biome、整形は `npm run format`）
+- Terraform の確認（CI と同じ。資格情報なし）: `terraform fmt -check -recursive infra && terraform -chdir=infra/bootstrap init -backend=false -input=false && terraform -chdir=infra/bootstrap validate && terraform -chdir=infra/bootstrap test && .github/scripts/tf-iam-decl-check.sh`（最後は IAM のリソースの宣言の一覧の固定）。Terraform は 1.16.4（手元に無ければ `mise exec terraform@1.16.4 -- terraform …`）
 - 起動: `cp .env.example .env` で値を入れて `npm start`（`npm run dev` は watch）。送信の確認は `curl -X POST "localhost:8080/webhook?key=$WEBHOOK_SECRET" -d 'テスト'`（実際に LINE に届く）
 
 ## Issue と実装の進め方
@@ -26,7 +30,7 @@ TradingView のアラート（webhook）を受けて、**1 つのアラートを
 
 - GitHub の操作はリポジトリのオーナーのアカウントで行う。gh のプロファイル（`GH_CONFIG_DIR`）は `.claude/settings.local.json` の `env`、git の remote は ssh の Host の別名で手元に設定する（どちらもリポジトリに書かない）
 - GCP のプロジェクトは option-simulator と同じものを使う（ID はリポジトリに書かない。`gcloud config get-value project` か `GCP_PROJECT_ID`）
-- 本番を変える操作（デプロイ・`terraform apply`・IAM・Secret Manager の値・GitHub の設定）はユーザーの明示承認を得てから
+- 本番を変える操作（デプロイ・`terraform apply`（`infra/bootstrap` の所有者の手元の apply を含む）・IAM・Secret Manager の値・GitHub の設定）はユーザーの明示承認を得てから
 
 ## リポジトリに置くもの / 置かないもの
 
@@ -39,5 +43,6 @@ TradingView のアラート（webhook）を受けて、**1 つのアラートを
 - 実際のアラートの本文（自分の銘柄・売買条件が分かるもの）。例は架空の銘柄・値
 - 特定の利用者の値（GCP プロジェクト ID・番号、GitHub のオーナー名・リポジトリ名、Cloud Run の URL、メールアドレス、ホームディレクトリのパス）。例外は `LICENSE` の著作権表示の 1 行
 - `.env`・`config.json`・`.claude/settings.local.json`・作業用ファイル（`.claude/handoff/`、`.claude/worktrees/`）
+- Terraform の state・plan・変数の実物（`*.tfstate`・`*.tfplan`・`*.tfvars`・`.terraform/`。gitignore。例は `*.tfvars.example`。`.terraform.lock.hcl` はコミットする）。state・plan の全文を Issue / PR に貼らない
 
 `.github/scripts/repo-values-check.sh` が形で検査する（CI の check）。コミット前に `git status --porcelain` を見て、`git add -A` / `git add .` は使わず個別に `git add` する。

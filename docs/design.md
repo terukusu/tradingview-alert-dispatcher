@@ -29,7 +29,8 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - 決定: Cloud Run の Invoker の IAM チェックを無効化する（`invoker_iam_disabled = true`）。ingress は `all`（TradingView はインターネットから来る）。プロジェクトで初めての未認証で呼べるサービスにすることはオーナーが承認済み
 - 理由: Google の推奨の方式で、IAM ポリシーに `allUsers` が載らない（既存サービスの `allUsers` 0 件という比較を崩さない）。TradingView は任意のヘッダを付けられないので、IAM や IAP の後ろには置けない。認証はアプリの共有シークレットで行う
 - 退けた案: `allUsers` に `roles/run.invoker` を付ける（IAM ポリシーに公開が残り、棚卸しで紛れる）。IAP（TradingView が通れない）
-- 注: Terraform の Google プロバイダが `invoker_iam_disabled` を持つ版かは **未確認**。#4 で公式ドキュメントで確かめる
+- 注: Terraform の Google プロバイダの `google_cloud_run_v2_service.invoker_iam_disabled` は 6.8.0 で追加された（CHANGELOG）。`infra/bootstrap` が固定した 8.9.0 のスキーマにあることを #3 で確かめた
+- 出典（プロバイダ）: https://github.com/hashicorp/terraform-provider-google/blob/main/CHANGELOG_v6.md
 - 出典: https://docs.cloud.google.com/run/docs/authenticating/public
 
 ### シークレットの渡し方（?key= と secret）
@@ -128,6 +129,36 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - 決定: Workload Identity Federation のプール・プロバイダ、tfstate のバケット、Artifact Registry のリポジトリはすべてこのリポジトリ用に新設する。IAM の付与は追加型（`*_iam_member`）だけにし、既存の authoritative な IAM を書き換えない。GCP のプロジェクト ID などは `TF_VAR_*` か未追跡の tfvars で渡し、リポジトリに書かない。bootstrap は所有者が手元で apply し、prod は deploy.yml が GitHub の Environment `prod` の承認を得てから apply する
 - 理由: 同じプロジェクトの既存の WIF のプール 2 つのプロバイダは、それぞれ別リポジトリの数値 ID に固定されている。流用すると別リポジトリが管理するリソースの変更になり、他リポジトリの権限に波及する（EPIC の終了条件 6 に触れる）
 - 退けた案: 既存の WIF・tfstate のバケット・Artifact Registry を流用する
+- 実装: `infra/bootstrap`（手順は `infra/README.md`）。WIF のプロバイダの `attribute_condition` はこのリポジトリの数値 ID とオーナーの数値 ID の両方を `&&` で固定し、さらに Environment `prod` のトークン（sub の末尾が `:environment:prod`）は `ref == 'refs/heads/main'` のときだけ受け付ける（多層防御。守るのはブランチの制限だけで、承認の欠落は Environment の保護に頼る。`environment` クレームは Environment を参照する job にしか無く、CEL で無いキーを参照すると評価がエラーになり拒否されるので、全トークンにある `sub` で判定する。環境の無い job のトークンは従来どおり通る）。bootstrap の state は所有者が gcloud で先に作る専用のバケットに置き、`import` で管理下に入れる。消せないように SA・プール・プロバイダ・バケット・Artifact Registry・シークレットに `deletion_policy = "PREVENT"`、バケットに `prevent_destroy`
+- 出典（条件）: https://docs.cloud.google.com/iam/docs/workload-identity-federation 、https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines 、https://docs.github.com/en/actions/reference/security/oidc 、https://github.com/google/cel-spec/blob/master/doc/langdef.md
+
+### SA と権限
+- 状態: 決定
+- 決定: SA を 3 つに分け、付与は次の表のものだけ（すべて追加型）
+
+| SA | 借用できるもの | 付与 |
+|---|---|---|
+| 実行用（Cloud Run のランタイム） | — | 3 つのシークレットそれぞれの `roles/secretmanager.secretAccessor` だけ（プロジェクト単位の付与なし） |
+| CI の apply 用 | GitHub の Environment `prod` の job の subject 1 件（`principal://…/subject/repo:<OWNER>@<OWNER_ID>/<REPO>@<REPO_ID>:environment:prod`。不変 ID 入りでない従来の形式も変数で選べる） | プロジェクト単位の `roles/run.admin`（下の「apply SA の Cloud Run の権限」）、実行用 SA 単位の `roles/iam.serviceAccountUser`、Artifact Registry のリポジトリ単位の `roles/artifactregistry.writer`、prod の state のバケット単位の `roles/storage.objectUser` |
+| CI の plan 用 | このリポジトリの job（`principalSet://…/attribute.repository_id/<REPO_ID>`） | プロジェクト単位の `roles/run.viewer`、リポジトリ単位の `roles/artifactregistry.reader`、prod の state のバケット単位の `roles/storage.objectViewer` |
+
+- bootstrap の state のバケットには CI の SA の付与を付けない（CI が bootstrap の state を読み書きできない）
+- plan SA は prod の state を読むだけ（`objectViewer`）なので、#4 の PR の plan は `-lock=false` で行う（ロックのために書き込みの付与を増やさない）
+- 付与の宣言（種類と名前）は `.github/scripts/tf-iam-decl-check.sh` で固定する（CI の check）。`terraform test` は各リソースの中の件数しか見られないため。実際のプロジェクトの IAM の差分は apply の後に `infra/README.md` の手順で確かめる
+- 理由: 実行用・apply・plan で権限を分け、シークレットを読めるのは実行用 SA だけにする。PR の plan は読み取りの SA で行い、書き込みは承認つきの Environment の job に限る
+- 退けた案: 1 つの SA で apply と plan を兼ねる（PR の job に書き込みの権限が渡る）。プロジェクト単位の `serviceAccountUser`・`secretAccessor`（ほかの SA・シークレットに波及する）
+
+### apply SA の Cloud Run の権限
+- 状態: 決定
+- 決定: apply SA の `roles/run.admin` はプロジェクト単位（条件なし）。GitHub の Environment `prod` の承認（main 限定）で守る。緩和:
+  - 借用は Environment `prod` の job の subject 1 件だけ。sub はブランチを含まず、存在しない Environment を参照する job は保護なしの Environment を自動作成するので、**Environment `prod` の保護（required reviewers = 所有者、deployment branches = `main` だけ、管理者の bypass なし）は bootstrap の apply より前に所有者が設定する**（main が承認を得て行う。読み取りの確認は `infra/README.md`「0. 前提」。2026-11-10 のオーナーの決定。required reviewers を使うためにリポジトリは public にした）
+  - WIF のプロバイダの条件で、Environment `prod` のトークンは `ref` が `refs/heads/main` のときだけ受け付ける（Environment の保護が外れたときの 2 枚目）
+  - #4 の `deploy.yml` は承認の前に plan の要約（アドレスと操作）を出す
+  - bootstrap の apply の後に既存のサービスのリビジョンと IAM が変わっていないことを確かめる（`infra/README.md`）
+- 理由: Cloud Run は IAM の条件のリソース属性（`resource.name` など）に対応していない。対応しないサービスでは、その条件は許可として解釈されないので、サービス名で絞った `run.admin` は作成・更新・取得・`setIamPolicy` のどれも許可しない。`invoker_iam_disabled` の設定には `run.services.setIamPolicy` が要り、`roles/run.developer` には無い
+- 影響: apply SA は同じプロジェクトの既存の Cloud Run サービス（別リポジトリの管理物）も変更できる
+- 退けた案: IAM の条件でサービス名に絞る（効かない）。サービスの作成を bootstrap（所有者）で行い、CI にはサービス単位の権限だけを付ける（#4 の構成が変わる。オーナーの指示はプロジェクト単位へのフォールバック）
+- 出典: https://docs.cloud.google.com/iam/docs/conditions-resource-attributes 、https://docs.cloud.google.com/iam/docs/conditions-attribute-reference 、https://docs.cloud.google.com/run/docs/authenticating/public 、https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments （存在しない Environment の参照で自動作成）、https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments （required reviewers の提供範囲）
 
 ### リージョン
 - 状態: 決定
@@ -137,7 +168,7 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 
 ### API の有効化
 - 状態: 決定
-- 決定: run・artifactregistry・secretmanager・iamcredentials・sts の API は有効化済み（2026-11-09 に観測）なので、Terraform では有効化しない。足りない API が出たら #3 で追加する（`disable_on_destroy = false`）
+- 決定: iam・iamcredentials・sts・artifactregistry・secretmanager・run・cloudresourcemanager・storage の API は有効化済み（2026-11-10 に観測）なので、Terraform では有効化しない（`infra/bootstrap` に `google_project_service` を書かない。事前の確認は `infra/README.md`）。足りない API が出たら追加を諮る（`disable_on_destroy = false`）
 - 理由: 既存サービスも使う API を、このリポジトリの destroy で止めないため
 - 退けた案: すべての API を Terraform で管理する（destroy で既存サービスが使う API を止めうる）
 
@@ -163,17 +194,16 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
   - LINE の月の上限を超えたときのステータスコードを API リファレンスで確かめ、再試行の対象にするかを決める
   - Dockerfile とイメージの検査（`PORT` の注入、0.0.0.0 で待ち受け）
   - README の TradingView の例を JSON の `secret` にする
-- #3（bootstrap）:
-  - WIF のプール・プロバイダ、実行用とデプロイ用の SA、Artifact Registry、tfstate のバケット、Secret Manager の入れ物（値は入れない）を新設する
-  - IAM は追加型だけ。API は有効化済み
-  - `CLAUDE.md`・implement-issue スキルの「`infra/` が無い間はデプロイ対象なし」と、`CLAUDE.md` の「設計は `docs/design.md`（あれば）」を実態に合わせる
+- #3（bootstrap）: 反映済み。`infra/bootstrap` に WIF のプール・プロバイダ、SA 3 つ（「SA と権限」）、Artifact Registry、tfstate のバケット 2 つ、Secret Manager の入れ物 3 つ（値なし）。apply と値の投入は所有者が `infra/README.md` の手順で行う。apply の前に Environment `prod` を保護する（同 0. 前提）
 - #4（prod の Cloud Run・deploy.yml）:
-  - `invoker_iam_disabled = true`（Terraform プロバイダの対応版を確かめる）、ingress `all`
+  - `invoker_iam_disabled = true`（google プロバイダ 8.9.0 にある）、ingress `all`
   - instance-based billing（`cpu_idle = false`、メモリ 512 MiB 以上）、最小インスタンス数 0、最大インスタンス数は小さく
   - リージョン asia-northeast1
   - `secretKeyRef`（版は変数、既定 `latest`）
   - HTTP の起動プローブを使うなら、コンテナの中から届くかを実機で確かめる
-  - deploy.yml は Environment `prod` の承認を得てから apply する
+  - deploy.yml は Environment `prod` の承認を得てから apply する（Environment の保護は #3 の apply の前に設定済み。「apply SA の Cloud Run の権限」）。承認の前に plan の要約を出す
+  - plan SA の `roles/run.viewer` で `infra/prod` の plan に足りるか確かめる。PR の plan は `-lock=false`（plan SA は state を読むだけ）。`pull_request_target` を使わない
+  - 不変 ID 入りの sub の形式（apply SA の借用の subject）が合っているかを最初の deploy の認証で確かめる
 - #5（通し確認・運用の手順）:
   - コールドスタートを含む 10 回の応答がすべて 3 秒未満か、`msg=dispatched` が 10 件か
   - 誤ったシークレットで 401 になるか（記録は `curl` のステータスだけ。URL は記録しない）
@@ -189,6 +219,9 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - https://docs.cloud.google.com/run/docs/known-issues
 - https://docs.cloud.google.com/run/docs/configuring/services/secrets
 - https://docs.cloud.google.com/run/docs/authenticating/public
+- https://docs.cloud.google.com/iam/docs/conditions-resource-attributes
+- https://docs.cloud.google.com/iam/docs/conditions-attribute-reference
+- https://github.com/hashicorp/terraform-provider-google/blob/main/CHANGELOG_v6.md
 - https://docs.cloud.google.com/run/docs/container-contract
 - https://docs.cloud.google.com/run/docs/configuring/healthchecks
 - https://cloud.google.com/run/pricing（料金。数値は未確認）

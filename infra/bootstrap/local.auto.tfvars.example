@@ -1,0 +1,6 @@
+# 例（架空の値）。cp local.auto.tfvars.example local.auto.tfvars で使う（*.tfvars は gitignore）。
+# GitHub の数値 ID はここに書かず、毎回 TF_VAR_github_repository_id・TF_VAR_github_owner_id で渡す（infra/README.md）
+project_id        = "example-project"
+github_repository = "example-owner/example-repo"
+# region                        = "asia-northeast1"
+# github_oidc_immutable_subject = true
