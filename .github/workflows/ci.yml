@@ -35,6 +35,21 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
+      # Terraform の検査（資格情報なし。init は backend なし、test はモックのプロバイダ）。apply はしない
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.4
+          terraform_wrapper: false
+      - name: terraform fmt
+        run: terraform fmt -check -recursive infra
+      - name: terraform validate（bootstrap）
+        run: |
+          terraform -chdir=infra/bootstrap init -backend=false -input=false -no-color
+          terraform -chdir=infra/bootstrap validate -no-color
+      - name: terraform test（bootstrap）
+        run: terraform -chdir=infra/bootstrap test -no-color
+      - name: IAM のリソースの宣言（bootstrap）
+        run: .github/scripts/tf-iam-decl-check.sh
       # コンテナイメージのビルドと検査（非 root・/app の中身・/health・未認証 401・SIGTERM で終了コード 0）。push はしない
       - name: イメージのビルド
         run: docker build -t dispatcher:ci .

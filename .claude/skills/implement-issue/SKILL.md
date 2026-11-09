@@ -37,11 +37,12 @@ allowed-tools: [Read, Edit, Write, Bash, Glob, Grep, Agent, TaskCreate, TaskUpda
 | 設定 | `src/config.ts` | 経路の定義。トークンの値は設定ファイルに書かず環境変数の名前で参照する |
 | テスト | `test/` | vitest。経路は偽の fetch で確かめる（本物の API を呼ばない） |
 | CI | `.github/workflows/` | `ci.yml` が検証の正 |
-| 設計 | `docs/design.md`（あれば） | **設計の正**。実装が設計と違うなら設計書も同じ PR で更新する |
+| IaC | `infra/` | `infra/bootstrap`（所有者が手元で apply）・`infra/prod`（#4。`deploy.yml` が apply）。手順は `infra/README.md` |
+| 設計 | `docs/design.md` | **設計の正**。実装が設計と違うなら設計書も同じ PR で更新する |
 
-- **`infra/` が無い間は本番が無く、デプロイ対象は常に「なし」**。`test -d infra` で判定する（ホスティング先が決まったらこの節と Phase 6 を実態に合わせる）
+- **デプロイ対象**: `infra/bootstrap` の変更 = 所有者が手元で apply する IaC（Phase 6 で main が手順を提示し、ユーザーの明示承認の後に **ユーザーが実行** する。CI は apply しない）。`infra/prod` = Cloud Run のサービス（#4 で追加する `deploy.yml` が Environment `prod` の承認の後に apply。まだ無い）。アプリのコードの変更は `infra/prod` ができるまで本番が無く、デプロイ対象は「なし」
 - 実行は Node 24（`.node-version`）の型の除去で TypeScript をそのまま動かす（ビルドしない）。ランタイムの依存は足さない方針（足すなら計画で理由を書いてユーザーに諮る）
-- 検証コマンド（CI と同じ）: `npm ci && npm run typecheck && npm run lint && npm test` と `.github/scripts/repo-values-check.sh .`。`ci.yml` に検査が増えたら手元でもそれに従う
+- 検証コマンド（CI と同じ）: `npm ci && npm run typecheck && npm run lint && npm test` と `.github/scripts/repo-values-check.sh .`。`infra/` を変えたら `terraform fmt -check -recursive infra` と `terraform -chdir=infra/bootstrap init -backend=false -input=false && terraform -chdir=infra/bootstrap validate && terraform -chdir=infra/bootstrap test && .github/scripts/tf-iam-decl-check.sh`（資格情報なし。Terraform 1.16.4、手元に無ければ `mise exec terraform@1.16.4 --`）。`ci.yml` に検査が増えたら手元でもそれに従う
 - 外部 API の上限（LINE: text 5000 文字、multicast 500 宛先、1 リクエスト 5 メッセージ、`X-Line-Retry-Key` による重複排除）は実装の定数とテストで固定する。仕様の出典 URL をコメントか設計書に書く
 - gh は `gh` コマンドをそのまま使う（アカウント切替はユーザーが `GH_CONFIG_DIR` 等で行う。スキル側で `gh auth switch` や設定変更をしない）。対象リポジトリは `REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)` で取り、`--repo "$REPO"` で渡す。デフォルトブランチ `main`
 
@@ -161,7 +162,7 @@ block とするのは次の 4 類型のみ。改善提案・好みは block に�
 1. 共通プロローグ
 2. 役割: Issue を実装可能な計画に落とす
 3. **調査**: 変更対象ファイル、呼び出し元（`grep -rn`）、`docs/design.md` の該当節、既存テスト（`test/`）。外部 API に触れる場合は公式ドキュメントで上限・エラー応答・重複排除の仕様を確かめ、出典 URL を handoff に書く
-4. **ドリフト確認**（`infra/` を変更する計画のときだけ）: `main` の作業ツリーで IaC の plan を取り、**今回の変更前から出ている差分**が無いか確認する。あれば handoff の `## 未解決・懸念` に「ドリフトあり: <リソース>」と書き、先に解消するかの判断をユーザーに求める前提で計画を書く
+4. **ドリフト確認**（`infra/` を変更する計画のときだけ）: `main` の作業ツリーで IaC の plan を取り、**今回の変更前から出ている差分**が無いか確認する（`infra/bootstrap` は所有者の資格情報で plan する。手順は `infra/README.md`。state がまだ無い初回は対象外）。あれば handoff の `## 未解決・懸念` に「ドリフトあり: <リソース>」と書き、先に解消するかの判断をユーザーに求める前提で計画を書く
 5. **計画に含める内容**:
    - AC と計画ステップの 1 対 1 対応
    - 変更対象ファイル一覧、デプロイ対象一覧
@@ -276,7 +277,7 @@ block とするのは次の 4 類型のみ。改善提案・好みは block に�
 
 ## Phase 6: デプロイ（main 直実行・必ずユーザー承認を得てから）
 
-`infra/` が無い（本番が無い）間は本 Phase に入らない。ホスティング先が決まったら、手段（CI のワークフロー名・Environment・シークレットの受け渡し）は `infra/`・`.github/workflows/`・runbook の実態を正とし、このスキルの例より優先する。
+デプロイ対象が「なし」なら本 Phase に入らない。手段は `infra/README.md`・`.github/workflows/` の実態を正とし、このスキルの例より優先する: `infra/bootstrap` は **所有者が手元で apply する**（main は plan の要約の取り方・apply・事後確認のコマンドを提示し、承認の後にユーザーが実行する。main は本番の資格情報で apply しない）。`infra/prod` は #4 の `deploy.yml`（Environment `prod` の承認）。
 
 **マージ承認はデプロイ承認ではない。** 以下の 1〜3 を済ませて差分とコマンドを提示し、ユーザーが明示的に「デプロイしてよい」と答えるまで 4 を実行しない。
 
