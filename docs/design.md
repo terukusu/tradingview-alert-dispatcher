@@ -5,7 +5,7 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - この文書が **決定事項の正**。実装が設計と違うときは、同じ PR でこの文書を更新する
 - 論点は `### <論点>` の見出しと、その直下の `- 状態: 決定` か `- 状態: 判断待ち` の 1 行で書く（`### ` は論点だけに使う）。マージの時点で判断待ちは残さない
 - 決定日: 2026-11-09（オーナー判断）
-- 「#2 で反映」などと書いた決定は、その Issue が終わるまでコードと食い違う（例: いまのコードは `GET /healthz`、ログに `title` を出す、LINE の再試行の最悪時間は 33 秒）
+- 「#N で反映」などと書いた決定は、その Issue が終わるまでコードと食い違う。反映したら、その記述を反映済みの事実に書き換える
 - 「未確認」と書いた事実は、公式ドキュメントで確かめていない。断定せず、確かめる Issue を書いておく
 
 ## 前提（外部の仕様）
@@ -13,7 +13,8 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - TradingView の webhook: 送り先のポートは 80 / 443 だけ、応答を 3 秒待って打ち切る、送信元の IPv4 は 4 つの固定、再送の記載なし、webhook を使うには 2 段階認証が必須、IPv6 は非対応 — https://www.tradingview.com/support/solutions/43000529348-about-webhooks/
 - TradingView のアラートの設定には URL とメッセージの欄だけがあり、任意のヘッダを付ける欄が無い（上のページには記載なし。設定画面の観察）。認証の情報は URL か本文で渡すしかない
 - このリポジトリの実装の値:
-  - LINE 経路の 1 回の送信の最悪時間 = タイムアウト 10 秒 × 3 回（初回 + 再試行 2 回）+ 再試行の待ち 1 秒 + 2 秒 = 33 秒（`src/notifiers/line.ts` の `TIMEOUT_MS`・`MAX_RETRIES`・`retryDelayMs`）
+  - LINE 経路の 1 チャネルの送信全体の締め切り 8 秒（multicast の全分割・再試行・待ちを含む。1 回の試行のタイムアウト 5 秒、再試行 2 回、待ち 0.5 秒・1 秒。`src/notifiers/line.ts` の `SEND_DEADLINE_MS`・`ATTEMPT_TIMEOUT_MS`・`MAX_RETRIES`・`retryDelayMs`）
+  - 停止時に処理中の配信を待つ上限 9 秒（`src/server.ts` の `SHUTDOWN_TIMEOUT_MS`）
   - 本文の上限 64 KiB（`src/server.ts` の `MAX_BODY_BYTES`。超えたら 413）
 - 観測（2026-11-09、読み取りのみ。値はリポジトリに書かない）:
   - 同じ GCP プロジェクトの既存 3 サービスに `allUsers` の `roles/run.invoker` は 0 件。このサービスがプロジェクトで最初の未認証で呼べるサービスになる
@@ -37,7 +38,7 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - 理由: Cloud Run のリクエストログにはクエリ文字列が残る（前提の観測）ので、`?key=` だとシークレットがリクエストログに載る。本文はアプリもログに出さない
 - 制約: 本番ではテキストのアラートは使えない（JSON が必須）
 - 退けた案: 本番も `?key=`（リクエストログにシークレットが載る）。本番で `?key=` を拒む設定をコードに足す（コードが増える。必要になれば別 Issue）
-- #5 の手順書と README の TradingView の例は JSON の `secret` で書く（README の更新は #2）
+- #5 の手順書と README の TradingView の例は JSON の `secret` で書く（README は JSON の `secret` の例にした）
 
 ### 送信元 IP の許可リスト
 - 状態: 決定
@@ -60,9 +61,9 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - 決定: いまの実装どおり **200 を先に返してから送る**。そのうえで Cloud Run を instance-based billing にする（`cpu_idle = false` / `--no-cpu-throttling`。メモリ 512 MiB 以上が条件）
 - 数値:
   - TradingView は応答を 3 秒待って打ち切る
-  - LINE 経路の最悪時間は 33 秒（タイムアウト 10 秒 × 3 回 + 待ち 1 秒 + 2 秒）
+  - LINE 経路の送信全体の締め切りは 8 秒（試行 5 秒、再試行 2 回、待ち 0.5 秒・1 秒）
   - インスタンスの停止は SIGTERM から SIGKILL まで 10 秒
-- 理由: 既定の request-based billing はリクエストの処理中だけ CPU を割り当て、応答の後の処理（background activity）は CPU が止まるか大きく絞られるので、応答の後の送信が止まりうる。送ってから応答する方式では LINE の最悪 33 秒が 3 秒に収まらず、同じ `X-Line-Retry-Key` での再試行を削る必要がある
+- 理由: 既定の request-based billing はリクエストの処理中だけ CPU を割り当て、応答の後の処理（background activity）は CPU が止まるか大きく絞られるので、応答の後の送信が止まりうる。送ってから応答する方式では LINE の締め切り 8 秒が 3 秒に収まらず、同じ `X-Line-Retry-Key` での再試行を削る必要がある
 - 費用: instance-based billing はアイドル中のインスタンスにも課金される。料金の数値（単価・無料枠）は **未確認**。#5 の前に https://cloud.google.com/run/pricing で確かめる（この文書には数値を書かない）
 - 退けた案: 応答の後に送る + request-based billing（いまの実装のままでは送信が止まりうるので、EPIC の終了条件 3 を満たせない）。送ってから応答する（LINE のタイムアウトと再試行を 3 秒の中に縮める必要があり、再試行の余地がほぼ無くなる）
 - 出典: https://docs.cloud.google.com/run/docs/configuring/billing-settings 、https://docs.cloud.google.com/run/docs/tips/general
@@ -75,9 +76,9 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 
 ### インスタンス停止時の扱い
 - 状態: 決定
-- 決定: SIGTERM を受けたら新しいリクエストの受付を止め、送信中の配信を待ってから終了する（#2 で反映。いまの `server.close` は応答の後の送信を待たない）。待ちは SIGKILL までの 10 秒の中に収める必要があるので、#2 で LINE のタイムアウトと再試行の総時間を停止の猶予 10 秒に収める（いまの最悪 33 秒のままでは収まらない）
+- 決定: SIGTERM を受けたら新しいリクエストの受付を止め、送信中の配信（本文の読み込みから応答の後の送信と結果のログまで）を待ってから終了する。待ちは SIGKILL までの 10 秒の中に収める: LINE の送信全体の締め切り 8 秒 < 停止時の待ちの上限 9 秒（`SHUTDOWN_TIMEOUT_MS`）< SIGKILL の 10 秒。上限で打ち切ったら残りの件数を `WARNING` のログに出し、終了コードは 0。終了中に既存の接続で届いたリクエストは 503 を返して送らない
 - 残るリスク: 猶予を超える配信は欠けうる（再送のキューは EPIC のスコープ外）。最小インスタンス数 0 のアイドルのインスタンスは最長 15 分で停止される
-- 退けた案: 最悪 33 秒のまま放置する（停止と重なると確実に欠ける）。Cloud Tasks / Pub/Sub で再送のキューを持つ（EPIC のスコープ外）
+- 退けた案: 再試行の最悪時間（当時 33 秒）を放置する（停止と重なると確実に欠ける）。Cloud Tasks / Pub/Sub で再送のキューを持つ（EPIC のスコープ外）
 - 出典: https://docs.cloud.google.com/run/docs/container-contract
 
 ## シークレットの置き場
@@ -101,19 +102,20 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 ### broadcast と LINE の無料枠
 - 状態: 決定
 - 決定: 本番では `LINE_TO`（送り先）を必須の手順にし、broadcast（送り先 0 件）は使わない
-- 事実: 日本のコミュニケーションプランは月 200 通まで無料で、送った人数で数える。上限を超えるとエラーになり送られない（結果は `ok: false` のログになる）
+- 事実:
+  - 日本のコミュニケーションプランは月 200 通まで無料で、送った人数で数える。上限を超えるとエラーになり送られない（結果は `ok: false` のログになる）
+  - 月の上限を超えたときは 429（`message` は `You have reached your monthly limit.`）。429 はレート制限・同時実行数の上限でも返る。公式の再試行のガイドは 5xx・タイムアウトを再試行し、409 と 429 を含む 4xx は再試行しないとしている。これに合わせて LINE 経路は 429 を再試行しない
 - 未確認:
   - broadcast が友だちの人数ぶん数えられることは、ページに明記されていない（「送った人数で数える」という記述からの推論）
-  - 上限を超えたときのステータスコードは公式ページで確かめていない。いまの実装は 429 を再試行の対象にしているので、429 なら無駄な再試行（待ちの合計 3 秒）になる。#2 で LINE の API リファレンスを確かめ、扱いを決める
 - 理由: broadcast は友だちになった第三者にも届き、無料枠を人数ぶん消費する
 - 退けた案: 本番で broadcast を許す
-- 出典: https://developers.line.biz/en/docs/messaging-api/pricing/
+- 出典: https://developers.line.biz/en/docs/messaging-api/pricing/ 、https://developers.line.biz/en/reference/messaging-api/#status-codes 、https://developers.line.biz/en/reference/messaging-api/#error-responses 、https://developers.line.biz/en/docs/messaging-api/retrying-api-request/
 
 ## ヘルスチェックのパス
 
 ### ヘルスチェックのパス
 - 状態: 決定
-- 決定: `GET /healthz` を `GET /health` に変える（#2 でコード変更）。`/health` は外から呼べる前提で、`ok` 以外を返さない。起動プローブは既定の TCP のままにする
+- 決定: ヘルスチェックは `GET /health`（200 `ok`）。旧パスの `/healthz` は 404。`/health` は外から呼べる前提で、`ok` 以外を返さない。起動プローブは既定の TCP のままにする
 - 理由: Cloud Run は `/_ah/` で始まるパスと、末尾が `z` の一部のパスを予約していて、末尾が `z` のパスは避けるよう推奨している。`/health` は末尾が `z` でも `/_ah/` 始まりでもない
 - 未確認: HTTP のプローブがコンテナの中から届くか（`/health` を HTTP の起動プローブに使えるか）はドキュメントに記載がない。使うなら #4 で実機で確かめる
 - 退けた案: `/healthz` を残す（外からは 404 になりうる）
@@ -144,8 +146,8 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 ### ログの項目
 - 状態: 決定
 - 決定: ログは 1 行 JSON（`severity` つき。Cloud Logging がそのまま読む）
-  - 出す: `msg=dispatched` とチャネルごとの `ok`・`elapsedMs`・`error`、認証失敗の `msg=unauthorized`
-  - 出さない: 本文・シークレット・トークン・送信先 ID・アラートの `title`（いまのコードは `title` を出している。外すのは #2）
+  - 出す: `msg=dispatched` とチャネルごとの `ok`・`elapsedMs`・`error`、認証失敗の `msg=unauthorized`（`WARNING`）、停止時の `msg=shutdown` / `msg=shutdown timeout` と残りの件数
+  - 出さない: 本文・シークレット・トークン・送信先 ID・アラートの `title`
 - Cloud Run のリクエストログのクエリ文字列は、本番で `?key=` を使わない運用（「シークレットの渡し方」）で避ける
 - #5 で使う絞り込み: `jsonPayload.msg="dispatched"` の件数と、各チャネルの `ok` の値。認証失敗は `jsonPayload.msg="unauthorized"` の件数
 - 理由: `title` には銘柄が入りうるので、ログに残る。#5 でログを要約するときに混じりうる
@@ -192,3 +194,6 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - https://cloud.google.com/run/pricing（料金。数値は未確認）
 - https://www.tradingview.com/support/solutions/43000529348-about-webhooks/
 - https://developers.line.biz/en/docs/messaging-api/pricing/
+- https://developers.line.biz/en/reference/messaging-api/#status-codes
+- https://developers.line.biz/en/reference/messaging-api/#error-responses
+- https://developers.line.biz/en/docs/messaging-api/retrying-api-request/

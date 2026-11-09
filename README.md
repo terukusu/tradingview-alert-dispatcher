@@ -45,14 +45,29 @@ npm ci
 npm start
 ```
 
-Node 24 が必要です（TypeScript をビルドなしで動かします）。
+Node 24 が必要です（TypeScript をビルドなしで動かします）。手元での送信の確認は次のとおりです（実際に LINE に届きます）。
+
+```sh
+curl -X POST "localhost:8080/webhook?key=$WEBHOOK_SECRET" -d 'テスト'
+```
+
+コンテナで動かすときは次のとおりです（実行時の依存が無いので、イメージには `package.json` と `src/` だけが入ります。`config.json` を使うなら `-v "$PWD/config.json:/app/config.json:ro"` を足します）。
+
+```sh
+docker build -t dispatcher:local .
+docker run --rm -p 8080:8080 --env-file .env dispatcher:local
+.github/scripts/image-check.sh dispatcher:local   # イメージの検査（非 root・中身・/health・未認証 401・SIGTERM での終了）
+```
+
+`GET /health` が 200 `ok` を返します。SIGTERM・SIGINT を受けると新しい受付を止め、送信中の配信が終わるのを待ってから（最大 9 秒）終了します。
 
 ### 4. TradingView のアラート
 
-アラートの「Webhook URL」に `https://<ホスト>/webhook?key=<WEBHOOK_SECRET>` を入れます。メッセージはテキストでも JSON でもかまいません。
+アラートの「Webhook URL」に `https://<ホスト>/webhook` を入れ、メッセージを JSON にして `"secret"` にシークレットを入れます（URL にシークレットを入れると、URL が残る場所から漏れやすいため）。
 
 ```json
 {
+  "secret": "<WEBHOOK_SECRET>",
   "title": "{{ticker}} シグナル",
   "message": "{{ticker}} が {{close}} で条件に到達（{{interval}}）",
   "channels": ["line-me"]
@@ -64,7 +79,9 @@ Node 24 が必要です（TypeScript をビルドなしで動かします）。
 | `title` | 見出し（任意） |
 | `message` | 本文。無ければ JSON 全体を本文にします |
 | `channels` | 送り先のチャネル ID（配列かカンマ区切り。省略すると既定の送り先） |
-| `secret` | URL に `?key=` を付けない場合のシークレット（本文には出ません） |
+| `secret` | webhook の共有シークレット（本文には出ません） |
+
+テキストのメッセージと URL の `?key=<WEBHOOK_SECRET>` での認証も受け付けますが、手元での確認用です（「3. 起動」の curl）。
 
 ## 開発
 
@@ -72,6 +89,7 @@ Node 24 が必要です（TypeScript をビルドなしで動かします）。
 npm ci
 npm run typecheck && npm run lint && npm test
 .github/scripts/repo-values-check.test.sh   # 個人の値・秘匿情報の形の検査
+docker build -t dispatcher:ci . && .github/scripts/image-check.sh dispatcher:ci   # イメージのビルドと検査（CI と同じ）
 ```
 
 構成と約束ごとは `CLAUDE.md` にあります。

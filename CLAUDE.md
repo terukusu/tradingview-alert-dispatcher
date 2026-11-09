@@ -4,19 +4,20 @@ TradingView のアラート（webhook）を受けて、**1 つのアラートを
 
 ## 作り
 
-- `src/server.ts`: HTTP の入口（`node:http`、依存なし）。`POST /webhook` は共有シークレット（`?key=` か JSON の `secret`。TradingView は任意のヘッダを付けられないため）を定数時間で比べ、本文の上限（64 KiB）を超えたら 413。受理したら **200 を先に返してから** 送る（TradingView は応答を 3 秒しか待たない）。`GET /healthz`。ログは 1 行 JSON（`severity` つき。Cloud Logging がそのまま読む）で、本文・シークレット・トークンを出さない
+- `src/server.ts`: HTTP の入口（`node:http`、依存なし）。`POST /webhook` は共有シークレット（`?key=` か JSON の `secret`。TradingView は任意のヘッダを付けられないため）を定数時間で比べ、本文の上限（64 KiB）を超えたら 413。受理したら **200 を先に返してから** 送る（TradingView は応答を 3 秒しか待たない）。`GET /health`（200 `ok`）。`0.0.0.0` の `PORT` で待ち受ける。処理中のリクエスト（裏の配信と `onDispatched` まで）を追跡し、SIGTERM・SIGINT で受付を止めてそれを待ってから exit 0（上限 `SHUTDOWN_TIMEOUT_MS` = 9 秒。超えたら残りの件数を `WARNING` のログに出す。終了中に届いたリクエストは 503）。ログは 1 行 JSON（`severity` つき。Cloud Logging がそのまま読む）で、本文・`title`・シークレット・トークン・送り先 ID を出さない
 - `src/alert.ts`: 本文 → `Alert`（JSON なら `title` / `message` / `channels`、それ以外はテキスト）と通知文の整形。**純関数**
 - `src/dispatcher.ts`: 送り先の解決（`alert.channels` → 設定の `defaultChannels` → 全チャネル）と並行送信。1 つの経路の失敗はほかを止めない
 - `src/notifiers/`: 経路ごとの実装。共通の口は `src/types.ts` の `Notifier`（`id` / `type` / `send(alert)`）。設定から作るのは `src/notifiers/index.ts` の `createNotifier`（経路を足すときは `ChannelConfig` の union・`createNotifier`・`src/config.ts` の検証の 3 か所）
-  - `line.ts`: 送り先 0 件 = broadcast、1 件 = push、2 件以上 = multicast（500 件ずつ）。本文は 5000 文字で切る。5xx・429・通信エラーは同じ `X-Line-Retry-Key` で 2 回まで再試行し、409（受理済み）は成功扱い
+  - `line.ts`: 送り先 0 件 = broadcast、1 件 = push、2 件以上 = multicast（500 件ずつ）。本文は 5000 文字で切る。5xx・通信エラー・試行のタイムアウト（5 秒）は同じ `X-Line-Retry-Key` で 2 回まで再試行し（待ち 0.5 秒・1 秒）、429（月の上限・レート制限）を含む 4xx は再試行しない。409（受理済み）は成功扱い。送信全体（multicast の全分割・再試行・待ち）に締め切り 8 秒（`SEND_DEADLINE_MS`）を 1 つ持ち、過ぎたら打ち切って失敗する
 - `src/config.ts`: シークレット・トークンは **環境変数だけ**（`WEBHOOK_SECRET`・`LINE_CHANNEL_ACCESS_TOKEN` など）。送り先は `CONFIG_PATH`（既定 `config.json`、gitignore）の JSON。ファイルが無ければ環境変数（`LINE_TO`）だけで LINE の 1 チャネルを作る。例は `config.example.json`・`.env.example`
+- `Dockerfile`・`.dockerignore`: `node:24.x.y-slim` をタグと digest で固定し、`package.json` と `src/` だけを `/app` に入れる（`.dockerignore` は許可リスト。実行時の依存が無いので依存のインストールもしない）。非 root（`USER node`）、exec 形式の `CMD` で node が SIGTERM を直接受ける。`.github/scripts/image-check.sh <image>` がイメージを検査する（非 root・`/app` の中身・`dependencies` なし・`/health` 200・未認証 401・`docker stop` で終了コード 0。架空の値で起動し、認証の通るリクエストは送らない）
 - `test/`: vitest。経路のテストは偽の `fetch` で行い、**実際の LINE API を呼ばない**。HTTP はポート 0 で立てて確かめる
 
 ## 開発
 
 - Node は 24（`.node-version`）。TypeScript は Node の型の除去でそのまま動かす（ビルドなし。`import` は `.ts` の拡張子つき、enum・引数プロパティなど消せない構文は使わない = `erasableSyntaxOnly`）。依存はバージョン固定（`package-lock.json` をコミット）。実行時の依存は足さない方針（足すなら Issue で理由を書く）
 - 手元の Node が 24 でなければ `mise exec node@24 -- <コマンド>`
-- 確認: `npm ci && npm run typecheck && npm run lint && npm test && .github/scripts/repo-values-check.test.sh`（CI と同じ。lint は Biome、整形は `npm run format`）
+- 確認: `npm ci && npm run typecheck && npm run lint && npm test && .github/scripts/repo-values-check.test.sh && docker build -t dispatcher:ci . && .github/scripts/image-check.sh dispatcher:ci`（CI と同じ。lint は Biome、整形は `npm run format`）
 - 起動: `cp .env.example .env` で値を入れて `npm start`（`npm run dev` は watch）。送信の確認は `curl -X POST "localhost:8080/webhook?key=$WEBHOOK_SECRET" -d 'テスト'`（実際に LINE に届く）
 
 ## Issue と実装の進め方
