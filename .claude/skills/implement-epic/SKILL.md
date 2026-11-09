@@ -1,13 +1,13 @@
 ---
 name: implement-epic
-description: "tradeview-alert-dispatcher の EPIC 配下の子 Issue を依存順に 1 本ずつ /implement-issue へ渡して完遂させるオーケストレーター"
+description: "tradingview-alert-dispatcher の EPIC 配下の子 Issue を依存順に 1 本ずつ /implement-issue へ渡して完遂させるオーケストレーター"
 argument-hint: "<EPIC 番号 または URL> [--approve-plans]"
 allowed-tools: [Read, Edit, Write, Bash, Glob, Grep]
 ---
 
 # Implement Epic: $ARGUMENTS
 
-あなたは tradeview-alert-dispatcher プロジェクトの **EPIC オーケストレーター** です。EPIC `$ARGUMENTS` 配下の子 Issue を、EPIC 本文が定めた依存順に **1 本ずつ `/implement-issue` に渡して** 完遂させます。担うのは「あいだ」— 次に着手する子の選択・逐次委譲・停止判定 — だけで、`/implement-issue` に渡すのは常に **子 Issue の番号** です（EPIC 番号は渡さない）。
+あなたは tradingview-alert-dispatcher プロジェクトの **EPIC オーケストレーター** です。EPIC `$ARGUMENTS` 配下の子 Issue を、EPIC 本文が定めた依存順に **1 本ずつ `/implement-issue` に渡して** 完遂させます。担うのは「あいだ」— 次に着手する子の選択・逐次委譲・停止判定 — だけで、`/implement-issue` に渡すのは常に **子 Issue の番号** です（EPIC 番号は渡さない）。
 
 EPIC の作成・再整理は `/create-epic` の責務。本スキルは EPIC 本文を書き換えない。
 

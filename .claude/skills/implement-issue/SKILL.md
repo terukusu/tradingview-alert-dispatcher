@@ -1,13 +1,13 @@
 ---
 name: implement-issue
-description: "tradeview-alert-dispatcher の GitHub Issue をリファインメント→調査・計画→実装→独立レビュー→PR→（承認後）デプロイまで、レビューを省略せずに進めるフルフロー"
+description: "tradingview-alert-dispatcher の GitHub Issue をリファインメント→調査・計画→実装→独立レビュー→PR→（承認後）デプロイまで、レビューを省略せずに進めるフルフロー"
 argument-hint: "<issue-number-or-url>"
 allowed-tools: [Read, Edit, Write, Bash, Glob, Grep, Agent, TaskCreate, TaskUpdate, TaskList, TaskGet]
 ---
 
 # Implement Issue: $ARGUMENTS
 
-あなたは tradeview-alert-dispatcher プロジェクトの実装エージェント (**main orchestrator**) です。GitHub Issue `$ARGUMENTS` について、**リファインメント → 調査・計画 → 実装 → コードレビュー → PR → デプロイ** を一貫して実行します。
+あなたは tradingview-alert-dispatcher プロジェクトの実装エージェント (**main orchestrator**) です。GitHub Issue `$ARGUMENTS` について、**リファインメント → 調査・計画 → 実装 → コードレビュー → PR → デプロイ** を一貫して実行します。
 
 **事前準備**: `CLAUDE.md`（特に「リポジトリに置くもの / 置かないもの」）、`README.md`、`docs/design.md`（あれば。設計の正）、`.github/workflows/ci.yml`（検証の正）を読み、構成を把握すること。`docs/design.md` が長ければ目次（`grep -n '^#' docs/design.md`）から Issue に関係する節だけを読む。コードの書き方は「既存コードに合わせる」（TypeScript strict、Biome の整形、`src/alert.ts` は純関数、通知経路は `Notifier` を実装）。
 
@@ -74,7 +74,7 @@ allowed-tools: [Read, Edit, Write, Bash, Glob, Grep, Agent, TaskCreate, TaskUpda
 
 ### handoff（Phase 間の受け渡し）
 
-- Phase 0 で `HANDOFF_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tradeview-alert-dispatcher-issue-<ISSUE_NUM>-XXXXXX")` を作り、その**絶対パス**を以降の subagent に渡す（リポジトリ内に置かない。誤コミット防止）
+- Phase 0 で `HANDOFF_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tradingview-alert-dispatcher-issue-<ISSUE_NUM>-XXXXXX")` を作り、その**絶対パス**を以降の subagent に渡す（リポジトリ内に置かない。誤コミット防止）
 - 各 Phase の subagent は `$HANDOFF_DIR/phase-<N>.md` に成果物を書き、reply は完了 status と handoff パスだけ（目安 200 字。Phase 2 の計画要旨のみ 800 字まで）
 - handoff の共通セクション: `## 決定事項` / `## 次 Phase が必要とする情報` / `## 未解決・懸念`。Phase 2 のみ `## 変更対象ファイル`（リポジトリルートからのパス、1 行 1 件、新規は `(新規)`）と `## デプロイ対象`（本番のサービス / IaC / GitHub 設定 / なし）を追加必須
 - main は各 Phase 後に必須セクションの存在を `grep -q '^## 決定事項'` 等で確認し、欠けていれば同じ subagent を 1 回だけ再起動、再失敗で中断する

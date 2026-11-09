@@ -1,4 +1,4 @@
-# 設計（tradeview-alert-dispatcher）
+# 設計（tradingview-alert-dispatcher）
 
 TradingView のアラート（webhook）を受けて複数の経路（第一弾は LINE）に送る中継サーバーを、GCP の Cloud Run で本番運用するための設計。受け口・送信のタイミング・シークレット・GCP の構成・ログなど、後続の実装（コンテナ・bootstrap・Cloud Run・通し確認）が判断基準にする決定をまとめる。
 
