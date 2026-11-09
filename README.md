@@ -1,4 +1,4 @@
-# tradeview-alert-dispatcher
+# tradingview-alert-dispatcher
 
 TradingView のアラートを webhook で受けて、LINE などの複数の通知先にまとめて送る小さなサーバーです。1 つのアラートを、設定した複数の経路へ並行して届けます（いまの経路は LINE。ほかの経路は順次追加）。
 

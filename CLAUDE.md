@@ -1,4 +1,4 @@
-# tradeview-alert-dispatcher
+# tradingview-alert-dispatcher
 
 TradingView のアラート（webhook）を受けて、**1 つのアラートを複数の経路に送る** 中継サーバー。第一弾の経路は LINE（Messaging API のチャネルアクセストークン）。動かす先は GCP（Cloud Run の予定）。設計は `docs/design.md`（あれば。決定事項と判断待ちが正）。
 

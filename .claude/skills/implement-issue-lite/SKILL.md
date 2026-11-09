@@ -1,13 +1,13 @@
 ---
 name: implement-issue-lite
-description: "why / what / AC が揃った tradeview-alert-dispatcher の小規模な GitHub Issue（文言・整形・ドキュメント等）を簡易フロー (subagent を起動せず main 直実行) で実装・PR まで進める。ユーザーが明示的に選んだときだけ使う"
+description: "why / what / AC が揃った tradingview-alert-dispatcher の小規模な GitHub Issue（文言・整形・ドキュメント等）を簡易フロー (subagent を起動せず main 直実行) で実装・PR まで進める。ユーザーが明示的に選んだときだけ使う"
 argument-hint: "<issue-number-or-url>"
 allowed-tools: [Read, Edit, Write, Bash, Glob, Grep]
 ---
 
 # Implement Issue (Lite): $ARGUMENTS
 
-あなたは tradeview-alert-dispatcher プロジェクトの実装エージェントです。GitHub Issue `$ARGUMENTS` を **簡易フロー** で実装します。
+あなたは tradingview-alert-dispatcher プロジェクトの実装エージェントです。GitHub Issue `$ARGUMENTS` を **簡易フロー** で実装します。
 
 **事前準備**: `CLAUDE.md`（特に「リポジトリに置くもの / 置かないもの」）、`README.md`、`docs/design.md`（あれば）の該当節を読み、構成を把握すること。プロジェクト前提（ファイルと役割の対応表、検証コマンド、本物の通知 API を呼ばない、秘密・送信先 ID・実際のペイロードを入れない、設計の正は `docs/design.md`、gh の扱い）は `.claude/skills/implement-issue/SKILL.md` の「プロジェクト前提」節を Read して従う。
 

@@ -1,6 +1,6 @@
 ---
 name: create-epic
-description: "tradeview-alert-dispatcher の EPIC（複数 Issue を束ねる tracking Issue）を新規作成し、既存 EPIC を実行可能な形に再整理する"
+description: "tradingview-alert-dispatcher の EPIC（複数 Issue を束ねる tracking Issue）を新規作成し、既存 EPIC を実行可能な形に再整理する"
 argument-hint: "<EPIC 番号 または トピック> [--dry-run]"
 allowed-tools: [Bash, Read, Write]
 ---

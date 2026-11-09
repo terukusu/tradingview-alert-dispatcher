@@ -1,6 +1,6 @@
 ---
 name: create-issue
-description: "tradeview-alert-dispatcher の GitHub Issue を最小骨格で起票する。why / what / AC のリファインメントは implement-issue Phase 1 で行うため、起票時は骨格と事実情報のみで OK"
+description: "tradingview-alert-dispatcher の GitHub Issue を最小骨格で起票する。why / what / AC のリファインメントは implement-issue Phase 1 で行うため、起票時は骨格と事実情報のみで OK"
 argument-hint: "<タイトル または トピック>"
 allowed-tools: [Bash, Read, Write]
 ---
