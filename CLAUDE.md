@@ -14,14 +14,16 @@ TradingView のアラート（webhook）を受けて、**1 つのアラートを
 - `test/`: vitest。経路のテストは偽の `fetch` で行い、**実際の LINE API を呼ばない**。HTTP はポート 0 で立てて確かめる
 - `infra/`: 本番の Terraform（手順は `infra/README.md`）
   - `bootstrap/`: WIF のプール・プロバイダ、SA 3 つ（実行用・CI の apply 用・plan 用）と追加型の付与、Artifact Registry、tfstate のバケット 2 つ、Secret Manager の入れ物 3 つ（値は持たない）。**所有者が手元で apply**（CI は apply しない）。プロジェクト ID・リポジトリ名・GitHub の数値 ID は `TF_VAR_*` で渡す。`tests/*.tftest.hcl` はモックのプロバイダの `terraform test`（値は架空）
-  - `prod/`: Cloud Run のサービス（#4 で追加。`deploy.yml` が Environment `prod` の承認の後に apply）
+  - `prod/`: Cloud Run のサービス `tvad` 1 つ（未認証で呼べる・instance-based billing・最小 0 最大 2・環境変数は Secret Manager の参照だけ）。IAM のリソース・data source・output を持たない。**本番を変えるのは `deploy.yml` だけ**（Environment `prod` の承認の後に apply）。`tests/*.tftest.hcl` はモック
+- `.github/workflows/`: `ci.yml`（`check` = 検査・テスト・Terraform の検証・イメージのビルドと検査。`terraform-plan` = 同じリポジトリの PR で plan SA の `plan -lock=false` の要約）、`deploy.yml`（main への push で plan → 差分があれば Environment `prod` の承認 → ビルド・push・apply・再 plan）。リポジトリは public なので、ログ・要約に plan / apply の全文・プロジェクト ID・番号・SA のメール・URL を出さない（`docs/design.md`「公開リポジトリの CI のログ」）
+- `.github/scripts/`: `repo-values-check.sh`（置かないものの検査）、`image-check.sh`（イメージの検査）、`tf-iam-decl-check.sh`（IAM のリソースの宣言の固定。bootstrap 8 件・prod 0 件）、`image.sh`（イメージのタグ = 入力のハッシュと digest の解決）、`tf-plan-summary.sh`（plan のアドレスと操作だけ）、`log-mask.sh`（ログのマスク）。`*.test.sh` がそれぞれのテスト
 
 ## 開発
 
 - Node は 24（`.node-version`）。TypeScript は Node の型の除去でそのまま動かす（ビルドなし。`import` は `.ts` の拡張子つき、enum・引数プロパティなど消せない構文は使わない = `erasableSyntaxOnly`）。依存はバージョン固定（`package-lock.json` をコミット）。実行時の依存は足さない方針（足すなら Issue で理由を書く）
 - 手元の Node が 24 でなければ `mise exec node@24 -- <コマンド>`
 - 確認: `npm ci && npm run typecheck && npm run lint && npm test && .github/scripts/repo-values-check.test.sh && docker build -t dispatcher:ci . && .github/scripts/image-check.sh dispatcher:ci`（CI と同じ。lint は Biome、整形は `npm run format`）
-- Terraform の確認（CI と同じ。資格情報なし）: `terraform fmt -check -recursive infra && terraform -chdir=infra/bootstrap init -backend=false -input=false && terraform -chdir=infra/bootstrap validate && terraform -chdir=infra/bootstrap test && .github/scripts/tf-iam-decl-check.sh`（最後は IAM のリソースの宣言の一覧の固定）。Terraform は 1.16.4（手元に無ければ `mise exec terraform@1.16.4 -- terraform …`）
+- Terraform の確認（CI と同じ。資格情報なし）: `terraform fmt -check -recursive infra`、`bootstrap`・`prod` それぞれ `terraform -chdir=infra/<dir> init -backend=false -input=false && terraform -chdir=infra/<dir> validate && terraform -chdir=infra/<dir> test`、`.github/scripts/tf-iam-decl-check.sh && .github/scripts/tf-iam-decl-check.sh infra/prod`（IAM のリソースの宣言の一覧の固定）、`.github/scripts/tf-iam-decl-check.test.sh && .github/scripts/log-mask.test.sh`。Terraform は 1.16.4（手元に無ければ `mise exec terraform@1.16.4 -- terraform …`）
 - 起動: `cp .env.example .env` で値を入れて `npm start`（`npm run dev` は watch）。送信の確認は `curl -X POST "localhost:8080/webhook?key=$WEBHOOK_SECRET" -d 'テスト'`（実際に LINE に届く）
 
 ## Issue と実装の進め方

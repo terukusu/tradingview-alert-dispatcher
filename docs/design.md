@@ -51,8 +51,10 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 
 ### 乱用への備え
 - 状態: 決定
-- 決定: 本文の上限 64 KiB（実装済み。超えたら 413）、最大インスタンス数を小さくする（値は #4 で決める）、認証に失敗したら 401 を返して配信しない（実装済み）
+- 決定: 本文の上限 64 KiB（実装済み。超えたら 413）、最大インスタンス数 **2**（`infra/prod` の変数 `max_instance_count`。検査は 1〜5 の整数）、認証に失敗したら 401 を返して配信しない（実装済み）
 - 理由: 未認証で呼べる受け口なので、費用と送信数が際限なく増えるのを防ぐ
+- 最大 2 の根拠: アラートは低頻度で、1 リクエストは即応答（送信は応答の後、8 秒以内）。1 インスタンスの同時実行は既定の 80 なので 2 台で 160 同時。instance-based billing は起動中のインスタンスすべてに課金されるので、乱用されたときの費用の上限を 2 台分に抑える。1 ではなく 2 にするのは、1 台の停止（リビジョンの切り替え・SIGTERM の 10 秒）と重なったときの余裕。検査の上限 5 は「小さく保つ」の歯止め（超えるなら設計を見直す）
+- 残るリスク: 160 を超える同時リクエストは Cloud Run が 429 を返し、TradingView は再送しない（取りこぼす）。この規模では起きない前提
 - 退けた案: アプリにレート制限を入れる（インスタンス間で共有できず、この規模では over-engineering）
 
 ## 送信のタイミング
@@ -116,10 +118,10 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 
 ### ヘルスチェックのパス
 - 状態: 決定
-- 決定: ヘルスチェックは `GET /health`（200 `ok`）。旧パスの `/healthz` は 404。`/health` は外から呼べる前提で、`ok` 以外を返さない。起動プローブは既定の TCP のままにする
-- 理由: Cloud Run は `/_ah/` で始まるパスと、末尾が `z` の一部のパスを予約していて、末尾が `z` のパスは避けるよう推奨している。`/health` は末尾が `z` でも `/_ah/` 始まりでもない
-- 未確認: HTTP のプローブがコンテナの中から届くか（`/health` を HTTP の起動プローブに使えるか）はドキュメントに記載がない。使うなら #4 で実機で確かめる
-- 退けた案: `/healthz` を残す（外からは 404 になりうる）
+- 決定: ヘルスチェックは `GET /health`（200 `ok`）。旧パスの `/healthz` は 404。`/health` は外から呼べる前提で、`ok` 以外を返さない。起動プローブは Cloud Run の既定の TCP のままにし、HTTP のプローブ（起動・liveness）は使わない（`infra/prod` にプローブを書かない）
+- 理由: Cloud Run は `/_ah/` で始まるパスと、末尾が `z` の一部のパスを予約していて、末尾が `z` のパスは避けるよう推奨している。`/health` は末尾が `z` でも `/_ah/` 始まりでもない。HTTP のプローブを足すと、コンテナの中から届くかという実機の確認が増える。TCP の起動プローブで、待ち受けを始めたことは分かる
+- HTTP のプローブがコンテナの中から届くかは、使わないので確かめない（使うことにしたら実機で確かめる）
+- 退けた案: `/healthz` を残す（外からは 404 になりうる）。`/health` の HTTP の起動・liveness プローブ（実機の確認が要り、このアプリでは TCP との差が小さい）
 - 出典: https://docs.cloud.google.com/run/docs/known-issues 、https://docs.cloud.google.com/run/docs/configuring/healthchecks
 
 ## GCP の構成
@@ -143,7 +145,7 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 | CI の plan 用 | このリポジトリの job（`principalSet://…/attribute.repository_id/<REPO_ID>`） | プロジェクト単位の `roles/run.viewer`、リポジトリ単位の `roles/artifactregistry.reader`、prod の state のバケット単位の `roles/storage.objectViewer` |
 
 - bootstrap の state のバケットには CI の SA の付与を付けない（CI が bootstrap の state を読み書きできない）
-- plan SA は prod の state を読むだけ（`objectViewer`）なので、#4 の PR の plan は `-lock=false` で行う（ロックのために書き込みの付与を増やさない）
+- plan SA は prod の state を読むだけ（`objectViewer`）なので、plan SA の plan（`deploy.yml` の plan job・`ci.yml` の `terraform-plan`）は `-lock=false` で行う（ロックのために書き込みの付与を増やさない）
 - 付与の宣言（種類と名前）は `.github/scripts/tf-iam-decl-check.sh` で固定する（CI の check）。`terraform test` は各リソースの中の件数しか見られないため。実際のプロジェクトの IAM の差分は apply の後に `infra/README.md` の手順で確かめる
 - 理由: 実行用・apply・plan で権限を分け、シークレットを読めるのは実行用 SA だけにする。PR の plan は読み取りの SA で行い、書き込みは承認つきの Environment の job に限る
 - 退けた案: 1 つの SA で apply と plan を兼ねる（PR の job に書き込みの権限が渡る）。プロジェクト単位の `serviceAccountUser`・`secretAccessor`（ほかの SA・シークレットに波及する）
@@ -153,7 +155,7 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - 決定: apply SA の `roles/run.admin` はプロジェクト単位（条件なし）。GitHub の Environment `prod` の承認（main 限定）で守る。緩和:
   - 借用は Environment `prod` の job の subject 1 件だけ。sub はブランチを含まず、存在しない Environment を参照する job は保護なしの Environment を自動作成するので、**Environment `prod` の保護（required reviewers = 所有者、deployment branches = `main` だけ、管理者の bypass なし）は bootstrap の apply より前に所有者が設定する**（main が承認を得て行う。読み取りの確認は `infra/README.md`「0. 前提」。2026-11-10 のオーナーの決定。required reviewers を使うためにリポジトリは public にした）
   - WIF のプロバイダの条件で、Environment `prod` のトークンは `ref` が `refs/heads/main` のときだけ受け付ける（Environment の保護が外れたときの 2 枚目）
-  - #4 の `deploy.yml` は承認の前に plan の要約（アドレスと操作）を出す
+  - `deploy.yml` は承認の前に plan の要約（アドレスと操作）を出し、apply の直前の plan が承認した plan と同じ「アドレスと操作」のときだけ apply する（「デプロイの流れ（deploy.yml）」）
   - bootstrap の apply の後に既存のサービスのリビジョンと IAM が変わっていないことを確かめる（`infra/README.md`）
 - 理由: Cloud Run は IAM の条件のリソース属性（`resource.name` など）に対応していない。対応しないサービスでは、その条件は許可として解釈されないので、サービス名で絞った `run.admin` は作成・更新・取得・`setIamPolicy` のどれも許可しない。`invoker_iam_disabled` の設定には `run.services.setIamPolicy` が要り、`roles/run.developer` には無い
 - 影響: apply SA は同じプロジェクトの既存の Cloud Run サービス（別リポジトリの管理物）も変更できる
@@ -168,9 +170,39 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 
 ### API の有効化
 - 状態: 決定
-- 決定: iam・iamcredentials・sts・artifactregistry・secretmanager・run・cloudresourcemanager・storage の API は有効化済み（2026-11-10 に観測）なので、Terraform では有効化しない（`infra/bootstrap` に `google_project_service` を書かない。事前の確認は `infra/README.md`）。足りない API が出たら追加を諮る（`disable_on_destroy = false`）
+- 決定: iam・iamcredentials・sts・artifactregistry・secretmanager・run・cloudresourcemanager・storage の API は有効化済み（2026-11-10 に観測。storage は `storage-api.googleapis.com` の名前で有効）なので、Terraform では有効化しない（`infra/bootstrap` に `google_project_service` を書かない。事前の確認は `infra/README.md`）。足りない API が出たら追加を諮る（`disable_on_destroy = false`）
 - 理由: 既存サービスも使う API を、このリポジトリの destroy で止めないため
 - 退けた案: すべての API を Terraform で管理する（destroy で既存サービスが使う API を止めうる）
+
+### イメージのタグ
+- 状態: 決定
+- 決定: 本番のイメージ（Artifact Registry の `tvad/dispatcher`）のタグは、イメージの入力（`Dockerfile`・`.dockerignore`・`.dockerignore` の許可リストの `package.json`・`src/`）の git のハッシュ（HEAD の blob / tree）から決める `src-<sha256 の先頭 20 桁>`（`.github/scripts/image.sh tag`）。入力のパスは `image.sh` に固定で書き、`.dockerignore` の許可リストとの一致を `ci.yml` の check で確かめる。Cloud Run には digest（`@sha256:`）の参照で渡す
+- 理由: ドキュメントだけのマージではタグが変わらず、Cloud Run の差分も承認待ちも出ない。同じ入力なら同じタグなので、Artifact Registry にあれば再ビルドしない（タグは不変）
+- 退けた案: git のコミットのハッシュ（ドキュメントだけのマージでも毎回新しいイメージ・リビジョン・承認待ちになる）。`latest` などの可変のタグ（何が動いているか分からない。Artifact Registry のタグは不変にしてある）
+
+### デプロイの流れ（deploy.yml）
+- 状態: 決定
+- 決定: 本番を変えるのは `.github/workflows/deploy.yml` だけ。main への push ごとに plan job（plan SA、`-lock=false`。Artifact Registry にイメージがあれば digest、無ければタグの参照で plan）→ 差分があるときだけ apply job（`environment: prod`。承認の後）→ イメージが無ければ GCP の認証より前にビルドと `image-check.sh` → apply SA で push → digest を解決（`@sha256:` でなければ失敗）→ plan を取り直し、承認した plan と「アドレスと操作」が同じときだけ apply → apply の直後の plan（`-detailed-exitcode`）が差分 0 でなければ失敗。`concurrency` は 1 グループで `cancel-in-progress: false`
+  - push は承認の後の apply job で行う（`artifactregistry.writer` は apply SA だけ。「SA と権限」を変えない）
+  - `paths` のフィルタは置かない。差分が無ければ apply job が動かない（承認待ちが出ない）ので、毎回の plan で足りる。フィルタの漏れ（新しい入力・参照先）で本番に反映されないことに気づけなくなるのを避け、毎回の plan はドリフトの検出も兼ねる
+  - `infra/prod` の traffic は「最新のリビジョンに 100%」を明示する。緊急の `gcloud run services update-traffic` でリビジョンを固定したら plan に差分が出て、次の apply で最新に戻る（書かないと固定が plan に出ず、以後のデプロイが流れないことに気づけない）
+  - `deletion_protection = true`（destroy と作り直しを止める）。`deletion_policy` は同じ働きの重複なので付けない
+  - `infra/prod` は IAM のリソース・data source を持たない（plan SA の読み取りの権限で plan できるように。実行用 SA のメールは組み立てる。`tf-iam-decl-check.sh` で 0 件を固定）
+  - PR では `ci.yml` の `terraform-plan`（同じリポジトリからの PR だけ、plan SA、`-lock=false`）で同じ要約を出す。必須の check にはしない
+- 理由: 手作業の `gcloud run deploy` にせず、同じ手順を繰り返せる・切り戻せる・誰が承認したかが残る経路にする。apply SA の権限（プロジェクト単位の `run.admin`）は広いので、承認の後に承認した plan と別の操作をしない
+- 退けた案: plan の前にビルドと push（plan SA に AR の writer が要る = 付与の変更）。plan ファイルを artifact で apply job に渡す（公開リポジトリの artifact は誰でも取れる）。`paths` のフィルタ（上）
+
+### 公開リポジトリの CI のログ
+- 状態: 決定
+- 決定: リポジトリは public で、Actions のログ・ジョブの要約は誰でも読める。プロジェクト ID・番号・SA のメール・`run.app` の URL・plan / apply の全文を出さない:
+  - プロジェクト ID は repository variable ではなく **secret**（`GCP_PROJECT_ID`）にする。secret は job の最初から自動で伏せられ、それを含む値（SA のメール・state のバケット名・AR のパス）も伏せられる。variable を job の `env` に置くと各 step のログの見出しにそのまま出て、`::add-mask::` は登録した step より前の行を伏せられない
+  - WIF のプロバイダ名（プロジェクト番号を含む）も secret（`GCP_WIF_PROVIDER`）。番号だけの出現は `log-mask.sh register` が `::add-mask::` で伏せる
+  - `terraform`・`gcloud`・`docker` の出力はファイルに書き、失敗時だけ `log-mask.sh filter`（9 桁以上の数字・メール・`run.app`・AR のパス・`projects/<id>`・state のバケット名を置き換える）を通した末尾を出す
+  - 要約に出すのは「アドレスと操作」・操作ごとの件数・イメージのタグ・digest の先頭 12 桁・差分の有無だけ（`tf-plan-summary.sh`。値 = before / after を出さない）。plan ファイルは artifact にしない。`infra/prod` は output を持たない（URL を出力しない）
+  - variables は `TF_STATE_BUCKET`・`GCP_SA_TF_PLAN`・`GCP_SA_TF_APPLY`（どれもプロジェクト ID を含むので secret の自動のマスクで伏せられる）
+- 理由: 公開のログから、プロジェクトの特定や攻撃の足がかりになる値を読めないようにする（CLAUDE.md「置かないもの」と同じ方針）
+- 未確認: ジョブの要約に secret の自動のマスクが効くか。要約には値を書かない作りにして依存しない
+- 退けた案: プロジェクト ID を variable にして `::add-mask::` で伏せる（最初の step の見出しに出る）
 
 ## ログ
 
@@ -195,15 +227,7 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
   - Dockerfile とイメージの検査（`PORT` の注入、0.0.0.0 で待ち受け）
   - README の TradingView の例を JSON の `secret` にする
 - #3（bootstrap）: 反映済み。`infra/bootstrap` に WIF のプール・プロバイダ、SA 3 つ（「SA と権限」）、Artifact Registry、tfstate のバケット 2 つ、Secret Manager の入れ物 3 つ（値なし）。apply と値の投入は所有者が `infra/README.md` の手順で行う。apply の前に Environment `prod` を保護する（同 0. 前提）
-- #4（prod の Cloud Run・deploy.yml）:
-  - `invoker_iam_disabled = true`（google プロバイダ 8.9.0 にある）、ingress `all`
-  - instance-based billing（`cpu_idle = false`、メモリ 512 MiB 以上）、最小インスタンス数 0、最大インスタンス数は小さく
-  - リージョン asia-northeast1
-  - `secretKeyRef`（版は変数、既定 `latest`）
-  - HTTP の起動プローブを使うなら、コンテナの中から届くかを実機で確かめる
-  - deploy.yml は Environment `prod` の承認を得てから apply する（Environment の保護は #3 の apply の前に設定済み。「apply SA の Cloud Run の権限」）。承認の前に plan の要約を出す
-  - plan SA の `roles/run.viewer` で `infra/prod` の plan に足りるか確かめる。PR の plan は `-lock=false`（plan SA は state を読むだけ）。`pull_request_target` を使わない
-  - 不変 ID 入りの sub の形式（apply SA の借用の subject）が合っているかを最初の deploy の認証で確かめる
+- #4（prod の Cloud Run・deploy.yml）: 反映済み。`infra/prod`（サービス `tvad`: `invoker_iam_disabled`・ingress `all`・instance-based billing・CPU 1・メモリ `512Mi`・最小 0・最大 2・`secretKeyRef` の版は変数で既定 `latest`・起動プローブは既定の TCP・`deletion_protection`・traffic は最新に 100%）、`.github/workflows/deploy.yml`（「デプロイの流れ（deploy.yml）」）、`ci.yml` の `terraform-plan`（PR の plan。`-lock=false`、`pull_request_target` を使わない）。手順は `infra/README.md`「prod（Cloud Run）」。デプロイの後に確かめる事実（plan SA の `roles/run.viewer` で plan が足りたか、不変 ID 入りの sub の形式が合っていたか）は、確かめたらここに書く
 - #5（通し確認・運用の手順）:
   - コールドスタートを含む 10 回の応答がすべて 3 秒未満か、`msg=dispatched` が 10 件か
   - 誤ったシークレットで 401 になるか（記録は `curl` のステータスだけ。URL は記録しない）

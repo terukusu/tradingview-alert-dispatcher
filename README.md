@@ -83,6 +83,15 @@ docker run --rm -p 8080:8080 --env-file .env dispatcher:local
 
 テキストのメッセージと URL の `?key=<WEBHOOK_SECRET>` での認証も受け付けますが、手元での確認用です（「3. 起動」の curl）。
 
+## 本番（Cloud Run）
+
+GCP の Cloud Run で動かす構成を `infra/`（Terraform）と `.github/workflows/deploy.yml` に置いています。
+
+- 土台（WIF・SA・Artifact Registry・tfstate・Secret Manager の入れ物）は `infra/bootstrap` を所有者が手元で 1 回 apply します。シークレットの値は Secret Manager に入れ、Terraform・リポジトリには持たせません
+- サービスは `infra/prod`。main へのマージごとに `deploy.yml` が plan し、ジョブの要約（アドレスと操作だけ）を確かめて GitHub の Environment `prod` を承認すると、イメージのビルド・push と apply が走ります。差分が無いマージ（ドキュメントだけ）では承認待ちは出ません
+- 本番の TradingView のアラートは JSON の `"secret"` でシークレットを渡します（`?key=` は使わない。Cloud Run のリクエストログに URL が残るため）
+- 手順（GitHub の設定・初回デプロイ・更新・切り戻し）は `infra/README.md`、設計の判断は `docs/design.md` にあります
+
 ## 開発
 
 ```sh
