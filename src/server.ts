@@ -18,24 +18,75 @@ export interface AppOptions {
 }
 
 /**
+ * 停止時（SIGTERM・SIGINT）に処理中の配信を待つ上限。
+ * Cloud Run の SIGTERM から SIGKILL までの 10 秒に収め、LINE の送信の締め切り 8 秒より長くする
+ */
+export const SHUTDOWN_TIMEOUT_MS = 9_000;
+
+export interface App {
+  server: Server;
+  /** 受付を止め、処理中のリクエスト（裏の配信と onDispatched まで）を待つ。何度呼んでも同じ Promise */
+  shutdown(timeoutMs?: number): Promise<{ remaining: number }>;
+}
+
+/**
  * - `POST /webhook`（`?key=<WEBHOOK_SECRET>` か JSON の secret で認証）: 受理したら 200 を即返し、送信は裏で行う
  *   （TradingView は応答を 3 秒しか待たない）
- * - `GET /healthz`: 200
+ * - `GET /health`: 200 `ok`
+ *
+ * 処理中のリクエスト（本文の読み込みから裏の配信・onDispatched まで）を追跡し、`shutdown` で待つ。
  */
-export function createApp(options: AppOptions): Server {
+export function createApp(options: AppOptions): App {
   const now = options.now ?? (() => new Date());
   const onDispatched = options.onDispatched ?? logResults;
+  const inflight = new Set<Promise<void>>();
+  let shuttingDown: Promise<{ remaining: number }> | undefined;
 
-  return createServer((req, res) => {
-    void handle(req, res).catch((e: unknown) => {
-      log('error', { msg: 'handler failed', error: e instanceof Error ? e.name : 'unknown' });
-      if (!res.headersSent) send(res, 500, 'internal error');
-    });
+  const server = createServer((req, res) => {
+    if (shuttingDown) {
+      // 終了中に既存の接続で届いたものは受けない（配信の締め切りが停止の猶予を超えうる）
+      res.setHeader('Connection', 'close');
+      return send(res, 503, 'shutting down');
+    }
+    const task = handle(req, res)
+      .catch((e: unknown) => {
+        log('error', { msg: 'handler failed', error: e instanceof Error ? e.name : 'unknown' });
+        if (!res.headersSent) send(res, 500, 'internal error');
+      })
+      .finally(() => inflight.delete(task));
+    inflight.add(task);
   });
+
+  return {
+    server,
+    shutdown(timeoutMs = SHUTDOWN_TIMEOUT_MS) {
+      shuttingDown ??= shutdown(timeoutMs);
+      return shuttingDown;
+    },
+  };
+
+  async function shutdown(timeoutMs: number): Promise<{ remaining: number }> {
+    server.close();
+    server.closeIdleConnections();
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<true>((r) => {
+      timer = setTimeout(() => r(true), timeoutMs);
+    });
+    const timedOut = await Promise.race([Promise.all(inflight).then(() => false), timeout]);
+    clearTimeout(timer);
+    const remaining = timedOut ? inflight.size : 0;
+    if (timedOut) {
+      log('warn', { msg: 'shutdown timeout', remaining });
+    } else {
+      log('info', { msg: 'shutdown', remaining });
+    }
+    server.closeAllConnections();
+    return { remaining };
+  }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://localhost');
-    if (url.pathname === '/healthz' && req.method === 'GET') return send(res, 200, 'ok');
+    if (url.pathname === '/health' && req.method === 'GET') return send(res, 200, 'ok');
     if (url.pathname !== '/webhook') return send(res, 404, 'not found');
     if (req.method !== 'POST') return send(res, 405, 'method not allowed');
 
@@ -85,28 +136,29 @@ function send(res: ServerResponse, status: number, text: string): void {
 }
 
 /** 構造化ログ（Cloud Logging が severity を読む）。本文・シークレットは出さない */
-function log(severity: 'info' | 'warn' | 'error', fields: Record<string, unknown>): void {
-  console.log(JSON.stringify({ severity: severity.toUpperCase(), ...fields }));
+const SEVERITY = { info: 'INFO', warn: 'WARNING', error: 'ERROR' } as const;
+
+function log(severity: keyof typeof SEVERITY, fields: Record<string, unknown>): void {
+  console.log(JSON.stringify({ severity: SEVERITY[severity], ...fields }));
 }
 
-function logResults(alert: Alert, results: DispatchResult[]): void {
+/** 送信結果のログ。title・本文・送り先 ID は出さない（銘柄・売買条件が分かるため） */
+function logResults(_alert: Alert, results: DispatchResult[]): void {
   const failed = results.filter((r) => !r.ok);
-  log(failed.length > 0 ? 'error' : 'info', {
-    msg: 'dispatched',
-    title: alert.title,
-    results,
-  });
+  log(failed.length > 0 ? 'error' : 'info', { msg: 'dispatched', results });
 }
 
 function main(): void {
   const config = loadConfig(process.env);
   const notifiers = config.channels.map((c) => createNotifier(c, { env: process.env }));
   const dispatcher = new Dispatcher(notifiers, config.defaultChannels);
-  const server = createApp({ webhookSecret: config.webhookSecret, dispatcher });
-  server.listen(config.port, () => {
+  const app = createApp({ webhookSecret: config.webhookSecret, dispatcher });
+  // Cloud Run は 0.0.0.0 の PORT に届ける
+  app.server.listen(config.port, '0.0.0.0', () => {
     log('info', { msg: 'listening', port: config.port, channels: notifiers.map((n) => n.id) });
   });
-  const shutdown = () => server.close(() => process.exit(0));
+  // 受付を止めて処理中の配信を待つ（上限 SHUTDOWN_TIMEOUT_MS）。打ち切りでも 0 で終わる（取りこぼしは WARNING のログ）
+  const shutdown = () => void app.shutdown().then(() => process.exit(0));
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }

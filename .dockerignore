@@ -1,0 +1,4 @@
+# 許可リスト: イメージに入れるのは package.json と src/ だけ（.env・config.json・.git・test・node_modules を入れない）
+*
+!package.json
+!src/

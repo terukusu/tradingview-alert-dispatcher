@@ -35,3 +35,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
+      # コンテナイメージのビルドと検査（非 root・/app の中身・/health・未認証 401・SIGTERM で終了コード 0）。push はしない
+      - name: イメージのビルド
+        run: docker build -t dispatcher:ci .
+      - name: イメージの検査
+        run: .github/scripts/image-check.sh dispatcher:ci
