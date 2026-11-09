@@ -1,0 +1,8 @@
+{
+  "channels": [
+    { "id": "line-me", "type": "line", "to": ["U<32 桁の 16 進>"] },
+    { "id": "line-group", "type": "line", "to": ["C<32 桁の 16 進>"] },
+    { "id": "line-other-bot", "type": "line", "tokenEnv": "LINE_OTHER_CHANNEL_ACCESS_TOKEN" }
+  ],
+  "defaultChannels": ["line-me"]
+}

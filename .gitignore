@@ -1,0 +1,9 @@
+node_modules/
+coverage/
+.env
+.env.*
+!.env.example
+config.json
+.claude/settings.local.json
+.claude/handoff/
+.claude/worktrees/
