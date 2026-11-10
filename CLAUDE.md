@@ -4,8 +4,8 @@ TradingView のアラート（webhook）を受けて、**1 つのアラートを
 
 ## 作り
 
-- `src/server.ts`: HTTP の入口（`node:http`、依存なし）。`POST /webhook` は共有シークレット（`?key=` か JSON の `secret`。TradingView は任意のヘッダを付けられないため）を定数時間で比べ、本文の上限（64 KiB）を超えたら 413。受理したら **200 を先に返してから** 送る（TradingView は応答を 3 秒しか待たない）。`GET /health`（200 `ok`）。`0.0.0.0` の `PORT` で待ち受ける。処理中のリクエスト（裏の配信と `onDispatched` まで）を追跡し、SIGTERM・SIGINT で受付を止めてそれを待ってから exit 0（上限 `SHUTDOWN_TIMEOUT_MS` = 9 秒。超えたら残りの件数を `WARNING` のログに出す。終了中に届いたリクエストは 503）。ログは 1 行 JSON（`severity` つき。Cloud Logging がそのまま読む）で、本文・`title`・シークレット・トークン・送り先 ID を出さない
-- `src/alert.ts`: 本文 → `Alert`（JSON なら `title` / `message` / `channels`、それ以外はテキスト）と通知文の整形。**純関数**
+- `src/server.ts`: HTTP の入口（`node:http`、依存なし）。`POST /webhook` は共有シークレット（`?key=` か本文の `secret`。壊れた JSON も `"secret": "…"` の形を読む。TradingView は任意のヘッダを付けられないため）を定数時間で比べ、本文の上限（64 KiB）を超えたら 413。受理したら **200 を先に返してから** 送る（TradingView は応答を 3 秒しか待たない）。`GET /health`（200 `ok`）。`0.0.0.0` の `PORT` で待ち受ける。処理中のリクエスト（裏の配信と `onDispatched` まで）を追跡し、SIGTERM・SIGINT で受付を止めてそれを待ってから exit 0（上限 `SHUTDOWN_TIMEOUT_MS` = 9 秒。超えたら残りの件数を `WARNING` のログに出す。終了中に届いたリクエストは 503）。ログは 1 行 JSON（`severity` つき。Cloud Logging がそのまま読む）で、本文・`title`・シークレット・トークン・送り先 ID を出さない
+- `src/alert.ts`: 本文 → `Alert`（JSON なら `title` / `message` / `channels`、それ以外はテキスト（`secret` の部分を除く））と通知文の整形。**純関数**
 - `src/dispatcher.ts`: 送り先の解決（`alert.channels` → 設定の `defaultChannels` → 全チャネル）と並行送信。1 つの経路の失敗はほかを止めない
 - `src/notifiers/`: 経路ごとの実装。共通の口は `src/types.ts` の `Notifier`（`id` / `type` / `send(alert)`）。設定から作るのは `src/notifiers/index.ts` の `createNotifier`（経路を足すときは `ChannelConfig` の union・`createNotifier`・`src/config.ts` の検証の 3 か所）
   - `line.ts`: 送り先 0 件 = broadcast、1 件 = push、2 件以上 = multicast（500 件ずつ）。本文は 5000 文字で切る。5xx・通信エラー・試行のタイムアウト（5 秒）は同じ `X-Line-Retry-Key` で 2 回まで再試行し（待ち 0.5 秒・1 秒）、429（月の上限・レート制限）を含む 4xx は再試行しない。409（受理済み）は成功扱い。送信全体（multicast の全分割・再試行・待ち）に締め切り 8 秒（`SEND_DEADLINE_MS`）を 1 つ持ち、過ぎたら打ち切って失敗する

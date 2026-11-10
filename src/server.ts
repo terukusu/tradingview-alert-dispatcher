@@ -30,7 +30,7 @@ export interface App {
 }
 
 /**
- * - `POST /webhook`（`?key=<WEBHOOK_SECRET>` か JSON の secret で認証）: 受理したら 200 を即返し、送信は裏で行う
+ * - `POST /webhook`（`?key=<WEBHOOK_SECRET>` か本文の secret で認証。壊れた JSON も `"secret": "…"` の形を読む）: 受理したら 200 を即返し、送信は裏で行う
  *   （TradingView は応答を 3 秒しか待たない）
  * - `GET /health`: 200 `ok`
  *
