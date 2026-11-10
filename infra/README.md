@@ -215,7 +215,7 @@ gcloud storage buckets get-iam-policy "gs://$B" --format=json \
 
 終わったら `rm -rf "$W"`。
 
-## シークレットの値の投入（所有者。#4 / #5 の前）
+## シークレットの値の投入（所有者。#4 の前）
 
 値は Terraform に持たせない。コンソールで入れるか、次のように **標準入力から** 入れる（値をコマンドラインの引数・シェルの履歴・ファイルに残さない。`read -rs` は入力を画面に出さない。末尾の改行は入らない）。
 
@@ -336,7 +336,7 @@ URL=$(gcloud run services describe tvad --region="$R" --format='value(status.url
 curl -s -o /dev/null -w '%{http_code}\n' "$URL/health"                                  # 200
 curl -s -o /dev/null -w '%{http_code}\n' -X POST "$URL/webhook" -d '{"message":"test"}' # 401
 curl -s -o /dev/null -w '%{http_code}\n' -X POST "$URL/webhook" -d '{"secret":"not-the-secret","message":"test"}'  # 401
-# 上の 2 回の時刻の範囲で unauthorized が 2 件以上・dispatched が 0 件（正しいシークレットでの送信は #5）
+# 上の 2 回の時刻の範囲で unauthorized が 2 件以上・dispatched が 0 件（正しいシークレットでの送信は下の「通し確認」）
 for m in unauthorized dispatched; do
   gcloud logging read "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"tvad\" AND jsonPayload.msg=\"$m\"" \
     --freshness=15m --format='value(timestamp)' | wc -l
@@ -355,6 +355,51 @@ run_snapshot | awk '/^== /{skip = ($2 == "tvad")} !skip' | diff "$W/run.before.t
 あわせて、次の `deploy.yml` の run（ドキュメントだけの変更のマージか、所有者の承認の後の `workflow_dispatch`）で plan job が「差分なし」・apply job が動かない（承認待ちが出ない）ことを確かめる。終わったら `rm -rf "$W"`。
 
 初回の apply が途中で失敗した場合（例: シークレットを解決できずリビジョンが Ready にならない）、サービスが tainted で state に残り、`deletion_protection = true` のため作り直し（replace）も止まる。原因を直して同じ経路で再 apply する（`terraform untaint` が要るなら所有者の手元で、承認の後）。
+
+### 通し確認
+
+本番を変えずに、TradingView → dispatcher → LINE が通ること、コールドスタートを含めて応答が 3 秒（TradingView の打ち切り）に間に合うことを確かめる（以後の再測定にも使う。2026-11-10 の結果は `docs/design.md`「最小インスタンス数」）。URL・シークレット・トークンは変数にだけ入れて表示しない。記録は件数・ステータス・秒数だけ（URL・インスタンス ID・ログの全文を Issue / PR に貼らない）。
+
+**A. 応答時間と件数（LINE に送らない）**: `channels` に設定に無い ID だけを指定すると、dispatcher は送らずに `ok: false`・`error: "未知のチャネル"` の結果を 1 件だけ持つ `msg=dispatched` を出す（`src/dispatcher.ts`）。結果が `ok: false` なので、この `dispatched` は severity ERROR で出る（想定どおり）。
+
+```bash
+R=asia-northeast1
+F='resource.type="cloud_run_revision" AND resource.labels.service_name="tvad"'
+REQ="$F AND logName:\"run.googleapis.com%2Frequests\""
+# 1. 前の 20 分のリクエストが 0 件（アイドルのインスタンスは最長 15 分で止まるので、次の 1 回目がコールドスタートになる）
+gcloud logging read "$REQ" --freshness=20m --format='value(timestamp)' | wc -l
+# 2. LINE の今月の送信数（前）。README.md「LINE の無料枠」と同じ
+T=$(gcloud secrets versions access latest --secret=tvad-line-channel-access-token)
+printf 'Authorization: Bearer %s' "$T" | curl -s -H @- https://api.line.me/v2/bot/message/quota/consumption; echo
+# 3. 10 回（1 秒間隔で順に）。シークレットは本文の secret で渡す（?key= はリクエストログに残るので使わない）
+URL=$(gcloud run services describe tvad --region="$R" --format='value(status.url)')
+export PROBE_SECRET=$(gcloud secrets versions access latest --secret=tvad-webhook-secret)
+START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+for i in $(seq 10); do
+  jq -nc '{secret: env.PROBE_SECRET, message: "probe", channels: ["probe-nonexistent"]}' \
+    | curl -s -o /dev/null -w "$i %{http_code} %{time_total}\n" -X POST "$URL/webhook" -H 'Content-Type: application/json' --data-binary @-
+  sleep 1
+done
+unset PROBE_SECRET URL
+sleep 60   # ログの取り込みを待つ
+# 4. リクエストログ: 10 件・すべて 200・httpRequest.latency の最大と最小（秒）
+gcloud logging read "$REQ AND httpRequest.requestMethod=\"POST\" AND timestamp>=\"$START\"" --format=json \
+  | jq '[.[].httpRequest] | {n: length, all200: all(.[]; .status == 200), latency: ([.[].latency | rtrimstr("s") | tonumber] | {max: max, min: min})}'
+# 5. dispatched が 10 件で、どれも probe-nonexistent の ok: false・未知のチャネルの 1 件だけ
+gcloud logging read "$F AND jsonPayload.msg=\"dispatched\" AND timestamp>=\"$START\"" --format=json \
+  | jq '{n: length, probe_only: all(.[]; [.jsonPayload.results[] | [.channel, .ok, .error]] == [["probe-nonexistent", false, "未知のチャネル"]])}'
+# 6. コールドスタート: 新しいインスタンスの listening が 1 件以上（システムログ varlog/system の「Starting new instance」でも分かる）
+gcloud logging read "$F AND jsonPayload.msg=\"listening\" AND timestamp>=\"$START\"" --format='value(timestamp)' | wc -l
+# 7. dispatched 以外の ERROR が 0 件
+gcloud logging read "$F AND severity>=ERROR AND NOT jsonPayload.msg=\"dispatched\" AND timestamp>=\"$START\"" --format='value(timestamp)' | wc -l
+# 8. LINE の今月の送信数（後）。2. と同じ = LINE に送っていない
+printf 'Authorization: Bearer %s' "$T" | curl -s -H @- https://api.line.me/v2/bot/message/quota/consumption; echo
+unset T
+```
+
+合格: 3. の 10 回がすべて `200` かつ `time_total` < 3.0 秒、4. が `n: 10`・`all200: true`・`latency.max` < 3、5. が `n: 10`・`probe_only: true`、6. が 1 以上、7. が 0、2. と 8. の `totalUsage` が同じ。curl の `time_total` は測る場所から asia-northeast1 までの往復を含み、TradingView の送信元とは経路が違う。`httpRequest.latency` がコールドスタートの起動待ちを含むかは公式ドキュメントに記載が無い（未確認）ので、両方で判定する。どれかが 3 秒以上なら、最小インスタンス数を 1 にするかをオーナーに諮る（`docs/design.md`「最小インスタンス数」。変えるなら `infra/prod` の PR）。
+
+**B. 実際の送達（LINE に 1 通）**: 所有者が README.md「TradingView のアラートの設定」の手順でテストのアラートを 1 件作り（本文は架空の内容）、1 回発火させる。TradingView の「アラートのログ」の Webhook status が成功、LINE に 1 通届く、その時刻の `jsonPayload.msg="dispatched"` が 1 件で `results` の全チャネルが `ok: true`、`quota/consumption` の `totalUsage` が +1 を確かめる。終わったらテストのアラートを消す。応答の後の送信が CPU の割り当てで止まらない（instance-based billing）ことは、A ではなくこの 1 通で確かめる（A は応答の後に通信しない）。
 
 ### 更新
 
@@ -376,7 +421,35 @@ traffic は Terraform で「最新のリビジョンに 100%」と明示して�
 
 ### シークレットの値の入れ替え
 
-値は「シークレットの値の投入」と同じ手順で新しい版を足す（`gcloud secrets versions add`）。版が `latest` でもインスタンスの起動時に解決されるので、反映には新しいリビジョンが要る（新しいリビジョンの作り方・ローテーションの詳しい手順は #5）。版を固定するなら `secret_version` を変える PR を同じ経路でデプロイする。
+シークレットの版（変数 `secret_version`。既定 `latest`）は、リビジョンの作成時ではなく **インスタンスの起動時** に解決される（Cloud Run のドキュメント。取れなければインスタンスは起動しない）。`latest` のまま新しい版を足すと、その後に起動したインスタンス（コールドスタート・スケールアウト）だけが新しい値になり、動いているインスタンスは古い値のまま（いつ切り替わるかが決まらない）。このため入れ替えは、**版の番号を指定する PR で新しいリビジョンを作って反映する**（`deploy.yml` の経路。`gcloud run services update` は使わない = 本番を変えるのは `deploy.yml` だけ）。
+
+`secret_version` は 3 つのシークレットに共通なので、指定する番号の版が **3 つすべてに enabled である** 必要がある（無いと新しいリビジョンが起動せず apply が失敗する。traffic は前のリビジョンのまま）。1 つだけ入れ替えるときも、ほかの 2 つにいまの値の複製を足して番号をそろえる。
+
+1. **新しい版を足す**（所有者）。入れ替えるシークレットは「シークレットの値の投入」と同じく `read -rs` で入れ、ほかはいま使っている版の値の複製を足す（値を表示しない。`CUR` はいまの `secret_version` = `infra/prod/variables.tf` の既定。`latest` か番号）:
+
+   ```bash
+   NEW=tvad-webhook-secret   # 入れ替えるシークレット
+   CUR=latest                # いまの secret_version
+   for s in tvad-webhook-secret tvad-line-channel-access-token tvad-line-to; do
+     if [ "$s" = "$NEW" ]; then
+       printf '%s の新しい値: ' "$s"; IFS= read -rs V; echo
+     else
+       V=$(gcloud secrets versions access "$CUR" --secret="$s")   # いまの値（表示しない）
+     fi
+     printf '%s' "$V" | gcloud secrets versions add "$s" --data-file=-
+     unset V
+   done
+   # 3 つの最新の版の番号（同じ N になること。違えば小さいほうに複製を足してそろえる）
+   for s in tvad-webhook-secret tvad-line-channel-access-token tvad-line-to; do
+     gcloud secrets versions list "$s" --filter='state=ENABLED' --sort-by=~createTime --limit=1 --format='value(name.basename())'
+   done
+   ```
+
+2. **PR**: `infra/prod/variables.tf` の `secret_version` の `default` を `"N"` にする（`infra/prod/tests/prod.tftest.hcl` の既定の版の検査も合わせて直す）。PR の `terraform-plan` の要約が `update` 1 件（`google_cloud_run_v2_service.tvad`）
+3. **マージ → 承認 → apply**（上の「更新」と同じ）。新しいリビジョンが Ready になり、すべてのインスタンスが版 N の値になる
+4. **webhook のシークレットのとき**: 3. の後に、README.md「TradingView のアラートの設定」の手順で新しい値を取り出し、すべてのアラートのメッセージの `"secret"` を書き換える。3. から書き換えまでの間は 401（TradingView は再送しない）なので、アラートが出ない時間帯に行い、終わったら `jsonPayload.msg="unauthorized"` の件数が増えていないことを見る（README.md「ログの見方」）
+5. **LINE のトークンのとき**: 古いトークンを無効にする（LINE Developers での再発行・取り消し）のは 3. の後。前に無効にすると、3. までの送信が 401 で失敗する
+6. 古い版は、切り戻し（前のリビジョンに traffic を移す）が要らなくなってから `gcloud secrets versions disable <版> --secret=<名前>` で止める（前のリビジョンは古い版を参照するので、止めると切り戻した先が起動できない）
 
 ### 手元の plan（所有者）
 
