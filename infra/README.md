@@ -304,6 +304,13 @@ gh secret list   --repo "$REPO" --json name -q '[.[].name]|sort'   # ["GCP_PROJE
 
 1. **作業前の記録**（マージの直前。比較の元）: bootstrap の「1. 作業前の記録」と同じく、スクラッチのディレクトリにプロジェクトの IAM ポリシーと `run_snapshot`（既存の Cloud Run サービスすべての最新のリビジョンと IAM）を取る（`project-iam.before.json`・`run.before.txt`）
 2. **GitHub の設定**（上。所有者の承認の後）
+   - **prod の state の初期化**（所有者、一度だけ。最初の PR の plan の前）: state が無いと `terraform init` が空の state とロックを書こうとし、読み取りだけの plan SA では `storage.objects.create` が 403 になる（2026-11-10 の #4 で確認）。所有者の手元で一度 init して空の state を作る（リソースは作らない。付与は足さない）:
+
+     ```bash
+     B=$(terraform -chdir=infra/bootstrap output -raw tf_state_bucket)
+     terraform -chdir=infra/prod init -input=false -backend-config="bucket=$B"
+     terraform -chdir=infra/prod state list | wc -l   # 0
+     ```
 3. **PR の plan**: PR の `ci.yml` の `terraform-plan` の要約が `create` 1 件（`google_cloud_run_v2_service.tvad`）だけであること。plan SA の権限不足で落ちたら、付与を足さずに止めて諮る
 4. **マージ** → `deploy.yml` の plan job の要約が `create` 1 件・イメージ「未作成」であることを確かめる
 5. **承認**: 所有者が Environment `prod` を承認する（画面の Review deployments）
