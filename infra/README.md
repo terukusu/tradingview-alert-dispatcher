@@ -452,6 +452,7 @@ unset T
 
 5. A・D が通ったら **bootstrap の apply**（ユーザーの明示承認・所有者の手元）: bootstrap の「1. 作業前の記録」の `W` と `default-sink.before.json` だけを取り、「3. init」→「4. plan と要約の確認」→「5. apply と差分 0 の確認」。plan の目安は `create` 1 件（`google_logging_project_exclusion.tvad_rejected`）・ほかは `no-op`（それ以外があれば apply しない）。apply の直後の再 plan が差分 0（API がフィルタを正規化して返すと永続差分になる。出たら filter の書き方を API の返す形に合わせる PR）
 6. **C**: bootstrap の「6. 事後の確認」の `default_sink_check`（すべて true）
+   - 除外は作成から効き始めるまで数分かかる（2026-11-10 の #16 では、作成の約 2 分後はまだ保存され、約 8 分後には保存されなくなった）。B は作成から 10 分ほどおいてから確かめる
 7. **B**: A の 3 回をもう一度送り、2 分以上待ってから（すべて期待の件数）:
 
    ```bash
