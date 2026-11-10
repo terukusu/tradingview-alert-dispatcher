@@ -110,6 +110,73 @@ describe('POST /webhook', () => {
   });
 });
 
+// 壊れた JSON（JSON.parse できない本文）。値はすべて架空
+describe('壊れた JSON の本文', () => {
+  const OTHER = 'other-secret-value';
+  const broken = (secret: string) =>
+    `{"secret":"${secret}","title":"${FAKE_TITLE}","message":"XYZ "test" 1.5"}`;
+
+  it('壊れた JSON の secret でも認証して 200、LINE に secret を送らない', async () => {
+    const { base, sent, done } = await start();
+    const body = broken(SECRET);
+    expect(() => JSON.parse(body)).toThrow();
+    const res = await fetch(`${base}/webhook`, { method: 'POST', body });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('accepted');
+    expect(await done).toEqual([expect.objectContaining({ channel: 'fake', ok: true })]);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.title).toBeUndefined();
+    expect(sent[0]?.message).toContain('XYZ "test" 1.5');
+    expect(sent[0]?.message).not.toContain(SECRET);
+    expect(sent[0]?.message).not.toContain('"secret"');
+  });
+
+  it('壊れた JSON の secret が違えば 401 で送らない', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { base, sent } = await start();
+    for (const secret of [OTHER, `${SECRET}x`, SECRET.slice(0, -1)]) {
+      const res = await fetch(`${base}/webhook`, { method: 'POST', body: broken(secret) });
+      expect(res.status).toBe(401);
+      expect(await res.text()).toBe('unauthorized');
+    }
+    await sleep(20);
+    expect(sent).toEqual([]);
+  });
+
+  it('?key= で認証した壊れた JSON でも secret を送らない', async () => {
+    const { base, sent, done } = await start();
+    const res = await fetch(`${base}/webhook?key=${SECRET}`, {
+      method: 'POST',
+      body: broken(OTHER),
+    });
+    expect(res.status).toBe(200);
+    await done;
+    expect(sent[0]?.message).toContain('XYZ "test" 1.5');
+    expect(sent[0]?.message).not.toContain(OTHER);
+    expect(sent[0]?.message).not.toContain('"secret"');
+  });
+
+  it('壊れた JSON のときもログに本文・secret を出さない', async () => {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { app, base } = await start(undefined, null);
+    const ok = await fetch(`${base}/webhook`, { method: 'POST', body: broken(SECRET) });
+    expect(ok.status).toBe(200);
+    expect(await ok.text()).toBe('accepted');
+    const ng = await fetch(`${base}/webhook`, { method: 'POST', body: broken(OTHER) });
+    expect(ng.status).toBe(401);
+    expect(await ng.text()).toBe('unauthorized');
+    await app.shutdown();
+    const lines = logLines(spy);
+    const dispatched = lines.filter((l) => l.msg === 'dispatched');
+    expect(dispatched).toHaveLength(1);
+    expect(Object.keys(dispatched[0] ?? {}).sort()).toEqual(['msg', 'results', 'severity']);
+    expect(lines).toContainEqual({ severity: 'WARNING', msg: 'unauthorized' });
+    for (const call of spy.mock.calls) {
+      for (const v of [SECRET, OTHER, FAKE_TITLE, '1.5']) expect(String(call[0])).not.toContain(v);
+    }
+  });
+});
+
 describe('GET /health', () => {
   it('GET /health は 200 で本文 ok', async () => {
     const { base } = await start();

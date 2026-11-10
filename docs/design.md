@@ -37,9 +37,13 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - 状態: 決定
 - 決定: 本番の TradingView のアラートは JSON の `secret` で共有シークレットを渡す。`?key=` はコードに残す（後方互換・ローカルでの確認用）が、本番の手順では使わない
 - 理由: Cloud Run のリクエストログにはクエリ文字列が残る（前提の観測）ので、`?key=` だとシークレットがリクエストログに載る。本文はアプリもログに出さない
-- 制約: 本番ではテキストのアラートは使えない（JSON が必須）
-- 退けた案: 本番も `?key=`（リクエストログにシークレットが載る）。本番で `?key=` を拒む設定をコードに足す（コードが増える。必要になれば別 Issue）
-- 反映済み: README.md「TradingView のアラートの設定」と `infra/README.md`「通し確認」は JSON の `secret` で書いた（#5）
+- 読み方（#14）: 本文が JSON の object として読めればその `secret`（string のときだけ）。読めない本文（壊れた JSON。スマートクォート・プレースホルダの値の `"`・改行・カンマの抜けなど）は、引用符（`"`・`“`・`”`）で囲んだ `secret` のキー・コロン・引用符で囲んだ値の形を正規表現で探し、キーがちょうど 1 つのときだけ取り出す（値は JSON の文字列としてデコード）。受け取り方（本文の `secret`）の範囲内で読み方を広げるだけで、決定は変えない。JSON として読めない本文は `secret` の部分を除いたテキストとして送る（`title`・`channels` は取り出さない。`{` で始まらないテキストの本文にも同じ規則を当てる）
+- 安全性の根拠（#14）: 比較は同じ `safeEqual`（SHA-256 + `timingSafeEqual`）。キーが 2 つ以上・値が空・閉じの引用符が無い（改行・本文の終わり）・JSON の文字列として読めない値は取り出さない（401）。どの経路（`?key=` を含む）でも、JSON として読めない本文からは `secret` の部分（値が引用符の形でなければその行の終わりまで）を除いて送るので、**認識した形**（キーが小文字の `secret`、引用符が `"`・`“`・`”`、コロンが半角）の値は LINE に載らない。認識しない形（`"Secret"` などの大小違い・シングルクォート・引用符の無いキー・全角コロン・値の中のスマートクォートより後ろ）は除かれずに載りうるが、それが起きるのは `?key=` で認証した本文だけで、本番の手順は `?key=` を使わない（本文の `secret` で認証した場合、その値は認識した形として必ず除かれる。#14 のレビューで乱数 150 万件と境界 28 種で確認）。式は入れ子の量指定子を持たず本文の長さに線形（64 KiB の悪意ある本文で 1 秒以内のテスト）。ログの項目は変えない
+- 既知の限界（#14）: 閉じの引用符が抜けて次のキーの引用符を閉じと読む本文（`"secret":"abc,"message":…`）は違う値を取り出して 401（誤って通ることはない）。正しくない本文の `message` の中に `"secret":"…"` の形があると、キーが 2 つになって 401
+- 制約: 本番のメッセージは `"secret": "…"` のキーと値の形が要る（JSON として壊れていても形があれば読む）。`secret` の無いテキストのアラートは本番で使えない（`?key=` の経路は本番で使わない）
+- 退けた案: 本番も `?key=`（リクエストログにシークレットが載る）。本番で `?key=` を拒む設定をコードに足す（コードが増える。必要になれば別 Issue）。スマートクォートを正規化して `JSON.parse` し直す（壊れ方は引用符だけではなく、`title` などを緩く取り出すとスコープが広がる。#14）。Content-Type で振り分ける（TradingView は壊れた JSON を `text/plain` で送る。#14）
+- 反映済み: README.md「TradingView のアラートの設定」と `infra/README.md`「通し確認」は JSON の `secret` で書いた（#5）。README.md に保存のときの警告・書き方の注意・手元での確かめ方を足した（#14）
+- 出典: https://www.tradingview.com/support/solutions/43000529348-about-webhooks/ 、https://www.tradingview.com/support/solutions/43000531021-how-to-use-a-variable-value-in-alert/
 
 ### 送信元 IP の許可リスト
 - 状態: 決定
@@ -254,6 +258,7 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - https://docs.cloud.google.com/run/docs/configuring/healthchecks
 - https://cloud.google.com/run/pricing（料金。数値は未確認）
 - https://www.tradingview.com/support/solutions/43000529348-about-webhooks/
+- https://www.tradingview.com/support/solutions/43000531021-how-to-use-a-variable-value-in-alert/
 - https://developers.line.biz/en/docs/messaging-api/pricing/
 - https://developers.line.biz/en/reference/messaging-api/#status-codes
 - https://developers.line.biz/en/reference/messaging-api/#error-responses
