@@ -236,6 +236,17 @@ run "defaults" {
     condition     = output.sa_run_email == "sa-tvad-run@example-project.iam.gserviceaccount.com" && length(output.secret_ids) == 3
     error_message = "出力の SA のメールかシークレット ID が違う"
   }
+
+  # #16 弾いたリクエストのログの除外（tvad のリクエストログの 401・403 とアプリの forbidden だけ）。
+  # 「ちょうど 1 つ」「google_logging_project_sink を宣言しない」は tf-iam-decl-check.sh の宣言の固定で見る
+  assert {
+    condition     = google_logging_project_exclusion.tvad_rejected.filter == "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"tvad\" AND ((log_id(\"run.googleapis.com/requests\") AND (httpRequest.status=401 OR httpRequest.status=403)) OR (log_id(\"run.googleapis.com/stdout\") AND jsonPayload.msg=\"forbidden\"))"
+    error_message = "ログの除外のフィルタが決めた文字列と違う"
+  }
+  assert {
+    condition     = google_logging_project_exclusion.tvad_rejected.disabled != true && startswith(google_logging_project_exclusion.tvad_rejected.name, "tvad-")
+    error_message = "ログの除外が無効か、名前が tvad- で始まらない"
+  }
 }
 
 # AC 3.2 従来の sub の形式（不変 ID なし）

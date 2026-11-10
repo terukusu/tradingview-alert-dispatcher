@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { isIPv4 } from 'node:net';
 import type { ChannelConfig } from './notifiers/index.ts';
 
 export interface AppConfig {
@@ -8,6 +9,8 @@ export interface AppConfig {
   channels: ChannelConfig[];
   /** alert に channels の指定が無いときの送り先。省略なら全チャネル */
   defaultChannels: string[] | undefined;
+  /** 送信元 IP の許可リスト（ALLOWED_SOURCE_IPS）。空なら送信元 IP で制限しない */
+  allowedSourceIps: string[];
 }
 
 interface FileConfig {
@@ -21,6 +24,7 @@ interface FileConfig {
  * - シークレット・トークンは環境変数だけ（WEBHOOK_SECRET・LINE_CHANNEL_ACCESS_TOKEN など）
  * - 送り先は CONFIG_PATH（既定 config.json）の JSON。ファイルが無ければ環境変数だけで
  *   LINE の 1 チャネル（id: "line"、送り先 LINE_TO（カンマ区切り。空なら broadcast））を作る
+ * - 送信元 IP の許可リストは ALLOWED_SOURCE_IPS（カンマ区切りの IPv4。公開の値なので config.json ではなく環境変数）
  */
 export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   const webhookSecret = env.WEBHOOK_SECRET ?? '';
@@ -31,6 +35,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     throw new Error('環境変数 PORT が不正');
   }
+  const allowedSourceIps = parseAllowedSourceIps(env.ALLOWED_SOURCE_IPS);
 
   const path = env.CONFIG_PATH ?? 'config.json';
   if (!existsSync(path)) {
@@ -44,6 +49,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
       webhookSecret,
       channels: [{ id: 'line', type: 'line', to }],
       defaultChannels: undefined,
+      allowedSourceIps,
     };
   }
 
@@ -53,7 +59,24 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     webhookSecret,
     channels: parseChannels(file.channels),
     defaultChannels: parseIdList(file.defaultChannels, 'defaultChannels'),
+    allowedSourceIps,
   };
+}
+
+/** カンマ区切りの IPv4（前後の空白・空の要素は除く）。IPv4 でない要素があれば失敗（値はメッセージに出さない） */
+export function parseAllowedSourceIps(v: string | undefined): string[] {
+  const ips = (v ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  ips.forEach((ip, i) => {
+    if (!isIPv4(ip)) {
+      throw new Error(
+        `環境変数 ALLOWED_SOURCE_IPS の ${i + 1} 番目が IPv4 でない（カンマ区切りの IPv4 だけ）`,
+      );
+    }
+  });
+  return ips;
 }
 
 export function parseChannels(v: unknown): ChannelConfig[] {

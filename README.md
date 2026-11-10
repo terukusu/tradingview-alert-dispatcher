@@ -35,6 +35,7 @@ cp .env.example .env   # WEBHOOK_SECRET・LINE_CHANNEL_ACCESS_TOKEN・LINE_TO �
 | `LINE_TO` | 送り先の ID（カンマ区切り）。空なら broadcast |
 | `PORT` | 待ち受けるポート（既定 8080） |
 | `CONFIG_PATH` | 送り先の設定ファイル（既定 `config.json`。無ければ上の環境変数だけで動く） |
+| `ALLOWED_SOURCE_IPS` | 送信元 IP の許可リスト（カンマ区切りの IPv4。既定は空 = 制限なし）。設定すると `GET /health` 以外は一覧に無い送信元を 403 で退けます。送信元は `X-Forwarded-For` の末尾（無ければ接続元）で判定するので、Cloud Run のように `X-Forwarded-For` を付け足すフロントの後ろでだけ使います（直接公開すると偽装できます） |
 
 複数のチャネル（例: 個人用とグループ用の LINE、別の公式アカウント）を使い分けるときは `config.example.json` を `config.json` にコピーして書きます。トークンは設定ファイルに書かず、`tokenEnv` で環境変数の名前を指定します。
 
@@ -81,6 +82,7 @@ GCP の Cloud Run で動かす構成を `infra/`（Terraform）と `.github/work
 - 土台（WIF・SA・Artifact Registry・tfstate・Secret Manager の入れ物）は `infra/bootstrap` を所有者が手元で 1 回 apply します。シークレットの値は Secret Manager に入れ、Terraform・リポジトリには持たせません
 - サービスは `infra/prod`。main へのマージごとに `deploy.yml` が plan し、ジョブの要約（アドレスと操作だけ）を確かめて GitHub の Environment `prod` を承認すると、イメージのビルド・push と apply が走ります。差分が無いマージ（ドキュメントだけ）では承認待ちは出ません
 - 本番の TradingView のアラートは JSON の `"secret"` でシークレットを渡します（手順は下の節）
+- 本番は送信元 IP の許可リストを TradingView の webhook の送信元 4 つ（公開の値。`infra/prod` の変数 `allowed_source_ips`）にしています。ほかの送信元からのリクエストは本文を読む前に 403 で、そのログ（`forbidden` とリクエストログの 401・403）は保存しません（`docs/design.md`「送信元 IP の許可リスト」「弾いたリクエストのログ」）。TradingView の送信元 IP が変わったら `allowed_source_ips` を直します
 - 手順（GitHub の設定・初回デプロイ・更新・切り戻し）は `infra/README.md`、設計の判断は `docs/design.md` にあります
 
 ## TradingView のアラートの設定
@@ -134,7 +136,7 @@ GCP の Cloud Run で動かす構成を `infra/`（Terraform）と `.github/work
 
 ### ログの見方
 
-アプリのログは 1 行 JSON です（本文・`title`・シークレット・トークン・送り先 ID は出しません）。1 つのアラートにつき `msg=dispatched` が 1 件出て、`results` にチャネルごとの `channel`・`ok`・`elapsedMs`・`error` が入ります。絞り込みは `jsonPayload.msg="dispatched"`（配信の結果）と `jsonPayload.msg="unauthorized"`（認証の失敗）です。
+アプリのログは 1 行 JSON です（本文・`title`・シークレット・トークン・送り先 ID は出しません）。1 つのアラートにつき `msg=dispatched` が 1 件出て、`results` にチャネルごとの `channel`・`ok`・`elapsedMs`・`error` が入ります。絞り込みは `jsonPayload.msg="dispatched"`（配信の結果）と `jsonPayload.msg="unauthorized"`（認証の失敗）です。本番では送信元 IP の許可リストがあるので、`unauthorized` は TradingView の送信元から来てシークレットが違うもの（アラートのメッセージの誤りなど）です。許可リストで弾いた `forbidden` の行と、401・403 のリクエストログは保存しません（件数は下の指標で見ます）。
 
 ```bash
 F='resource.type="cloud_run_revision" AND resource.labels.service_name="tvad"'
@@ -144,13 +146,15 @@ gcloud logging read "$F AND jsonPayload.msg=\"dispatched\"" --freshness=1d --for
 # 失敗した経路（どれかの経路が ok: false だと severity は ERROR。LINE の月の上限の 429 もここ）
 gcloud logging read "$F AND jsonPayload.msg=\"dispatched\" AND severity>=ERROR" --freshness=7d --format=json \
   | jq -c '.[] | {t: .timestamp, failed: [.jsonPayload.results[] | select(.ok == false) | {channel, error}]}'
-# 認証の失敗（シークレットなし・違い）の件数。目立って増えたら docs/design.md「送信元 IP の許可リスト」の再検討の条件
+# 認証の失敗（TradingView の送信元からのシークレットなし・違い）の件数。あればアラートのメッセージの "secret" を確かめる
 gcloud logging read "$F AND jsonPayload.msg=\"unauthorized\"" --freshness=1d --format='value(timestamp)' | wc -l
 # アプリ以外も含めたエラー
 gcloud logging read "$F AND severity>=ERROR AND NOT jsonPayload.msg=\"dispatched\"" --freshness=1d --format='value(timestamp,jsonPayload.msg)'
 ```
 
-TradingView の Webhook status が失敗なのに `dispatched` も `unauthorized` も無いときは、URL の誤りかリクエストが届いていません（リクエストログ `httpRequest.status` を見る）。
+許可リストで弾いた件数（403）は、Cloud Monitoring の Metrics Explorer で指標 `run.googleapis.com/request_count`（Cloud Run Revision の Request Count）を `service_name=tvad`・`response_code=403` で絞って見ます（ログの除外と無関係で、指標は無料です）。
+
+TradingView の Webhook status が失敗なのに `dispatched` も `unauthorized` も無いときは、URL の誤りか、リクエストが届いていないか、許可リストで 403 になっています（TradingView の送信元 IP が変わった可能性。上の指標の 403 と、TradingView の公式ページの IP を `infra/prod` の `allowed_source_ips` と照らす。403 のリクエストログは保存しないので、200 などほかのステータスは `httpRequest.status` で見る）。
 
 ### LINE の無料枠
 

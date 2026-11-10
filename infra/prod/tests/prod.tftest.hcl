@@ -55,13 +55,13 @@ run "defaults" {
     error_message = "実行用 SA が sa-tvad-run でない"
   }
 
-  # AC 3.5 環境変数は Secret Manager の参照だけ（平文の value なし。PORT・CONFIG_PATH なし）
+  # AC 3.5 秘密の環境変数は Secret Manager の参照だけ。平文の value は公開の値の ALLOWED_SOURCE_IPS だけ（PORT・CONFIG_PATH なし）
   assert {
-    condition     = length(google_cloud_run_v2_service.tvad.template[0].containers[0].env) == 3 && toset([for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.name]) == toset(["WEBHOOK_SECRET", "LINE_CHANNEL_ACCESS_TOKEN", "LINE_TO"])
-    error_message = "環境変数の名前の集合が WEBHOOK_SECRET・LINE_CHANNEL_ACCESS_TOKEN・LINE_TO ちょうどでない"
+    condition     = length(google_cloud_run_v2_service.tvad.template[0].containers[0].env) == 4 && toset([for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.name]) == toset(["WEBHOOK_SECRET", "LINE_CHANNEL_ACCESS_TOKEN", "LINE_TO", "ALLOWED_SOURCE_IPS"])
+    error_message = "環境変数の名前の集合が WEBHOOK_SECRET・LINE_CHANNEL_ACCESS_TOKEN・LINE_TO・ALLOWED_SOURCE_IPS ちょうどでない"
   }
   assert {
-    condition = { for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.name => e.value_source[0].secret_key_ref[0].secret } == {
+    condition = { for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.name => e.value_source[0].secret_key_ref[0].secret if e.value == null } == {
       WEBHOOK_SECRET            = "tvad-webhook-secret"
       LINE_CHANNEL_ACCESS_TOKEN = "tvad-line-channel-access-token"
       LINE_TO                   = "tvad-line-to"
@@ -69,12 +69,17 @@ run "defaults" {
     error_message = "環境変数とシークレットの対応が違う"
   }
   assert {
-    condition     = alltrue([for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.value_source[0].secret_key_ref[0].version == "latest"])
+    condition     = alltrue([for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.value_source[0].secret_key_ref[0].version == "latest" if e.value == null])
     error_message = "シークレットの版が既定の latest でない"
   }
+  # #16 平文の value を持つのは ALLOWED_SOURCE_IPS だけで、値は TradingView の 4 つ（公開の値）
   assert {
-    condition     = alltrue([for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.value == null])
-    error_message = "平文の value を持つ環境変数がある"
+    condition     = { for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.name => e.value if e.value != null } == { ALLOWED_SOURCE_IPS = "52.89.214.238,34.212.75.30,54.218.53.128,52.32.178.7" }
+    error_message = "平文の value を持つ環境変数が ALLOWED_SOURCE_IPS だけでないか、値が既定の TradingView の 4 つでない"
+  }
+  assert {
+    condition     = alltrue([for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : length(e.value_source) == 0 if e.value != null])
+    error_message = "平文の環境変数がシークレットの参照も持っている"
   }
 
   assert {
@@ -92,9 +97,65 @@ run "secret_version_pinned" {
 
   # AC 3.5 版の変数
   assert {
-    condition     = alltrue([for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.value_source[0].secret_key_ref[0].version == "3"])
+    condition     = alltrue([for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.value_source[0].secret_key_ref[0].version == "3" if e.value == null])
     error_message = "シークレットの版が変数の 3 でない"
   }
+}
+
+# #16 許可リストを空にすると ALLOWED_SOURCE_IPS を置かない（= 制限なし。切り戻し）
+run "allowed_source_ips_empty" {
+  command = apply
+
+  variables {
+    allowed_source_ips = []
+  }
+
+  assert {
+    condition     = length(google_cloud_run_v2_service.tvad.template[0].containers[0].env) == 3 && !contains([for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.name], "ALLOWED_SOURCE_IPS")
+    error_message = "allowed_source_ips = [] でも ALLOWED_SOURCE_IPS の環境変数がある"
+  }
+  assert {
+    condition     = alltrue([for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.value == null])
+    error_message = "allowed_source_ips = [] で平文の value を持つ環境変数がある"
+  }
+}
+
+run "allowed_source_ips_custom" {
+  command = apply
+
+  variables {
+    allowed_source_ips = ["192.0.2.1"]
+  }
+
+  assert {
+    condition     = { for e in google_cloud_run_v2_service.tvad.template[0].containers[0].env : e.name => e.value if e.value != null } == { ALLOWED_SOURCE_IPS = "192.0.2.1" }
+    error_message = "allowed_source_ips の値が ALLOWED_SOURCE_IPS に渡らない"
+  }
+}
+
+# #16 許可リストは IPv4 だけ
+run "allowed_source_ips_ipv6" {
+  command = plan
+  variables {
+    allowed_source_ips = ["2001:db8::1"]
+  }
+  expect_failures = [var.allowed_source_ips]
+}
+
+run "allowed_source_ips_cidr" {
+  command = plan
+  variables {
+    allowed_source_ips = ["192.0.2.0/24"]
+  }
+  expect_failures = [var.allowed_source_ips]
+}
+
+run "allowed_source_ips_out_of_range" {
+  command = plan
+  variables {
+    allowed_source_ips = ["256.0.0.1"]
+  }
+  expect_failures = [var.allowed_source_ips]
 }
 
 # plan はタグの参照を許す（イメージがまだ無い初回の plan。apply の digest の強制は deploy.yml）

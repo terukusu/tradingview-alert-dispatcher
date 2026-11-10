@@ -1,11 +1,11 @@
-# Cloud Run のサービス（docs/design.md「公開方式」「送信のタイミング」「シークレットの置き場」）。
+# Cloud Run のサービス（docs/design.md「公開方式」「送信のタイミング」「シークレットの置き場」「送信元 IP の許可リスト」）。
 # IAM のリソースと data source は書かない（plan SA の読み取りの権限で plan できるように。tf-iam-decl-check.sh で 0 件を固定）
 
 locals {
   # bootstrap の実行用 SA（data source で引かずに組み立てる）
   run_service_account = "sa-tvad-run@${var.project_id}.iam.gserviceaccount.com"
 
-  # アプリの環境変数 → bootstrap のシークレット。平文の value は置かない。
+  # アプリの環境変数 → bootstrap のシークレット。秘密の値は Secret Manager の参照だけ（平文は公開の値の ALLOWED_SOURCE_IPS だけ）。
   # PORT は Cloud Run が注入し、CONFIG_PATH は使わない（本番は環境変数だけの LINE の 1 チャネル）
   secret_env = {
     WEBHOOK_SECRET            = "tvad-webhook-secret"
@@ -54,6 +54,14 @@ resource "google_cloud_run_v2_service" "tvad" {
               version = var.secret_version
             }
           }
+        }
+      }
+      # 送信元 IP の許可リスト（公開の値なので平文）。空なら置かない = 制限なし
+      dynamic "env" {
+        for_each = length(var.allowed_source_ips) > 0 ? { ALLOWED_SOURCE_IPS = join(",", var.allowed_source_ips) } : {}
+        content {
+          name  = env.key
+          value = env.value
         }
       }
       # 起動プローブは Cloud Run の既定（TCP）。HTTP のプローブは使わない（docs/design.md「ヘルスチェックのパス」）

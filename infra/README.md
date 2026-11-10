@@ -4,7 +4,7 @@
 
 | ルート | 中身 | apply する人 | state の場所 |
 |---|---|---|---|
-| `infra/bootstrap` | WIF のプール・プロバイダ、SA 3 つ（実行用・CI の apply 用・CI の plan 用）と付与、Artifact Registry、tfstate のバケット 2 つ、Secret Manager の入れ物 3 つ | **所有者が手元で 1 回**（IAM を変えるので CI には apply させない） | `<PROJECT_ID>-tvad-tfstate-bootstrap`（prefix `bootstrap`） |
+| `infra/bootstrap` | WIF のプール・プロバイダ、SA 3 つ（実行用・CI の apply 用・CI の plan 用）と付与、Artifact Registry、tfstate のバケット 2 つ、Secret Manager の入れ物 3 つ、`_Default` シンクへのログの除外 1 つ（`logging.tf`） | **所有者が手元で 1 回**（IAM を変えるので CI には apply させない） | `<PROJECT_ID>-tvad-tfstate-bootstrap`（prefix `bootstrap`） |
 | `infra/prod` | Cloud Run のサービス `tvad` 1 つ（IAM のリソース・data source なし） | CI（`.github/workflows/deploy.yml`。GitHub の Environment `prod` の承認の後） | `<PROJECT_ID>-tvad-tfstate`（prefix `prod`） |
 
 - IAM の付与は追加型（`*_iam_member`）だけ。`*_iam_policy` / `*_iam_binding` は使わない（同じプロジェクトの既存の付与を書き換えない）
@@ -20,7 +20,7 @@ terraform fmt -check -recursive infra
 terraform -chdir=infra/bootstrap init -backend=false -input=false
 terraform -chdir=infra/bootstrap validate
 terraform -chdir=infra/bootstrap test   # モックのプロバイダ。値はすべて架空
-.github/scripts/tf-iam-decl-check.sh      # IAM のリソースの宣言（種類と名前）が決めた 8 件と同じか
+.github/scripts/tf-iam-decl-check.sh      # IAM のリソースの宣言（種類と名前）が決めた 8 件、ログの設定（google_logging_*）が除外 1 件と同じか
 terraform -chdir=infra/prod init -backend=false -input=false
 terraform -chdir=infra/prod validate
 terraform -chdir=infra/prod test        # モックのプロバイダ。値はすべて架空
@@ -124,6 +124,8 @@ run_snapshot() {
   done
 }
 run_snapshot > "$W/run.before.txt"
+# _Default シンクの除外の名前と包含のフィルタ（logging.tf の除外の前後の比較）
+gcloud logging sinks describe _Default --format=json | jq '{ex: [.exclusions[]?.name], filter}' > "$W/default-sink.before.json"
 ```
 
 ### 2. bootstrap 用のバケットを作る
@@ -159,7 +161,7 @@ terraform show -json bootstrap.tfplan \
 
 | 操作 | 件数 | 中身 |
 |---|---|---|
-| `create` | 22 | SA 3・プール 1・プロバイダ 1・SA の付与 3（借用 2・actAs 1）・プロジェクトの付与 2・バケット 1（prod）・バケットの付与 2・Artifact Registry 1・その付与 2・シークレット 3・その付与 3 |
+| `create` | 23 | SA 3・プール 1・プロバイダ 1・SA の付与 3（借用 2・actAs 1）・プロジェクトの付与 2・バケット 1（prod）・バケットの付与 2・Artifact Registry 1・その付与 2・シークレット 3・その付与 3・ログの除外 1（`google_logging_project_exclusion.tvad_rejected`。#16 より前に apply した環境では、この 1 件だけの `create` になる = 下の「送信元 IP の許可リストとログの除外（#16）」） |
 | import | 1 | `google_storage_bucket.tfstate["bootstrap"]`。操作は `no-op` か `update`（gcloud で作ったときに無い設定 = 古い世代の削除のルールや Terraform だけの属性 `deletion_policy`・`force_destroy` を合わせる差分）。`update` なら `terraform show bootstrap.tfplan` のこのリソースの差分がそれだけであることを見る |
 | それ以外の `update`・`delete`・`replace` | 0 | 1 件でもあれば apply しない |
 
@@ -211,6 +213,16 @@ done
 # bootstrap 用バケットに CI の SA の付与が無い（0）
 gcloud storage buckets get-iam-policy "gs://$B" --format=json \
   | jq --arg a "serviceAccount:$APPLY_SA" --arg p "serviceAccount:$PLAN_SA" '[.bindings[].members[] | select(. == $a or . == $p)] | length'
+# _Default シンク: 増えた除外が tvad-rejected-requests の 1 件だけ・消えた除外 0・包含のフィルタが同じ（すべて true）
+default_sink_check() {
+  gcloud logging sinks describe _Default --format=json | jq --slurpfile b "$W/default-sink.before.json" '
+    [.exclusions[]?.name] as $a | {
+      added_only_tvad: (($a - $b[0].ex) == ["tvad-rejected-requests"]),
+      removed_none: (($b[0].ex - $a) == []),
+      filter_same: (.filter == $b[0].filter),
+      enabled: ([.exclusions[]? | select(.name == "tvad-rejected-requests") | (.disabled // false)] == [false])}'
+}
+default_sink_check
 ```
 
 終わったら `rm -rf "$W"`。
@@ -260,11 +272,12 @@ Cloud Run は IAM の条件のリソース属性に対応していないので�
 ## bootstrap の切り戻し・撤去
 
 - 付与だけを外す: 該当の `*_iam_member` を消して apply（追加型なので、ほかの付与は残る）
+- ログの除外を外す: `logging.tf` のリソースを消す PR → 所有者の apply（`_Default` のほかの除外・包含のフィルタは変わらない。除外していた間のログは戻らない）。`gcloud logging sinks update _Default --remove-exclusions=…` は Terraform と食い違うので使わない
 - 全体の撤去: 各リソースの `deletion_policy = "PREVENT"` とバケットの `prevent_destroy` を外してから `terraform destroy`。バケットとシークレットは中身を確かめてから手で消す。WIF のプールは削除後 30 日は同じ ID を作り直せない
 
 ## prod（Cloud Run）
 
-`infra/prod` はサービス `tvad`（`google_cloud_run_v2_service`）1 つだけ。未認証で呼べる（`invoker_iam_disabled = true`、ingress `all`）、instance-based billing（`cpu_idle = false`、CPU 1、メモリ `512Mi`）、最小 0・最大 2（変数 `max_instance_count`。1〜5）、実行用 SA `sa-tvad-run`、環境変数 3 つは Secret Manager の参照だけ（版は変数 `secret_version`、既定 `latest`）、`deletion_protection = true`、traffic は最新のリビジョンに 100%。IAM のリソース・data source・output を持たない（plan SA の読み取りの権限で plan できるように。URL を出力しない）。設計は `docs/design.md`。
+`infra/prod` はサービス `tvad`（`google_cloud_run_v2_service`）1 つだけ。未認証で呼べる（`invoker_iam_disabled = true`、ingress `all`）、instance-based billing（`cpu_idle = false`、CPU 1、メモリ `512Mi`）、最小 0・最大 2（変数 `max_instance_count`。1〜5）、実行用 SA `sa-tvad-run`、環境変数 4 つ（Secret Manager の参照 3 つ（版は変数 `secret_version`、既定 `latest`）と平文の `ALLOWED_SOURCE_IPS` 1 つ（変数 `allowed_source_ips`、既定は TradingView の 4 つ。`[]` なら置かない = 制限なし））、`deletion_protection = true`、traffic は最新のリビジョンに 100%。IAM のリソース・data source・output を持たない（plan SA の読み取りの権限で plan できるように。URL を出力しない）。設計は `docs/design.md`。
 
 本番を変えるのは `.github/workflows/deploy.yml` だけ（手作業の `gcloud run deploy` はしない）:
 
@@ -322,7 +335,9 @@ R=asia-northeast1
 # 設定（すべて true）。jq のパスは gcloud run services describe（v1 の形）
 gcloud run services describe tvad --region="$R" --format=json | jq '
   .spec.template.spec.containers[0] as $c | .spec.template.metadata.annotations as $a | {
-    env3_secret_only: (($c.env | length) == 3 and all($c.env[]; .valueFrom.secretKeyRef != null and .value == null)),
+    env4: (($c.env | length) == 4),
+    secrets3: (([$c.env[] | select(.valueFrom.secretKeyRef != null and .value == null) | .name] | sort) == ["LINE_CHANNEL_ACCESS_TOKEN", "LINE_TO", "WEBHOOK_SECRET"]),
+    allowed_source_ips: ([$c.env[] | select(.value != null) | {name, value}] == [{name: "ALLOWED_SOURCE_IPS", value: "52.89.214.238,34.212.75.30,54.218.53.128,52.32.178.7"}]),
     line_to: any($c.env[]; .name == "LINE_TO"),
     digest: ($c.image | contains("@sha256:")),
     invoker_iam_disabled: (.metadata.annotations["run.googleapis.com/invoker-iam-disabled"] == "true"),
@@ -334,10 +349,12 @@ gcloud run services describe tvad --region="$R" --format=json | jq '
     run_sa: (.spec.template.spec.serviceAccountName | startswith("sa-tvad-run@"))}'
 URL=$(gcloud run services describe tvad --region="$R" --format='value(status.url)')   # 表示しない
 curl -s -o /dev/null -w '%{http_code}\n' "$URL/health"                                  # 200
-curl -s -o /dev/null -w '%{http_code}\n' -X POST "$URL/webhook" -d '{"message":"test"}' # 401
-curl -s -o /dev/null -w '%{http_code}\n' -X POST "$URL/webhook" -d '{"secret":"not-the-secret","message":"test"}'  # 401
-# 上の 2 回の時刻の範囲で unauthorized が 2 件以上・dispatched が 0 件（正しいシークレットでの送信は下の「通し確認」）
-for m in unauthorized dispatched; do
+# TradingView 以外の送信元からなので、送信元 IP の許可リストで 403（allowed_source_ips = [] なら 401）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "$URL/webhook" -d '{"message":"test"}' # 403
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "$URL/webhook" -d '{"secret":"not-the-secret","message":"test"}'  # 403
+# 上の 2 回の時刻の範囲で dispatched が 0 件（forbidden は bootstrap のログの除外で保存されないので 0 件。
+# 除外の前なら 2 件以上。allowed_source_ips = [] なら unauthorized が 2 件以上。正しいシークレットでの送信は下の「通し確認」）
+for m in forbidden unauthorized dispatched; do
   gcloud logging read "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"tvad\" AND jsonPayload.msg=\"$m\"" \
     --freshness=15m --format='value(timestamp)' | wc -l
 done
@@ -400,6 +417,59 @@ unset T
 合格: 3. の 10 回がすべて `200` かつ `time_total` < 3.0 秒、4. が `n: 10`・`all200: true`・`latency.max` < 3、5. が `n: 10`・`probe_only: true`、6. が 1 以上、7. が 0、2. と 8. の `totalUsage` が同じ。curl の `time_total` は測る場所から asia-northeast1 までの往復を含み、TradingView の送信元とは経路が違う。`httpRequest.latency` がコールドスタートの起動待ちを含むかは公式ドキュメントに記載が無い（未確認）ので、両方で判定する。どれかが 3 秒以上なら、最小インスタンス数を 1 にするかをオーナーに諮る（`docs/design.md`「最小インスタンス数」。変えるなら `infra/prod` の PR）。
 
 **B. 実際の送達（LINE に 1 通）**: 所有者が README.md「TradingView のアラートの設定」の手順でテストのアラートを 1 件作り（本文は架空の内容）、1 回発火させる。TradingView の「アラートのログ」の Webhook status が成功、LINE に 1 通届く、その時刻の `jsonPayload.msg="dispatched"` が 1 件で `results` の全チャネルが `ok: true`、`quota/consumption` の `totalUsage` が +1 を確かめる。終わったらテストのアラートを消す。応答の後の送信が CPU の割り当てで止まらない（instance-based billing）ことは、A ではなくこの 1 通で確かめる（A は応答の後に通信しない）。
+
+### 送信元 IP の許可リストとログの除外（#16）
+
+`infra/prod` の `allowed_source_ips`（既定は TradingView の 4 つ）と `infra/bootstrap/logging.tf`（`_Default` シンクへの除外 1 つ）を、すでに動いている本番に入れる手順（設計は `docs/design.md`「送信元 IP の許可リスト」「弾いたリクエストのログ」）。**アプリを先に反映して A・D を確かめ、その後に bootstrap の除外を apply して C・B を確かめる**（D が 403 のとき、まだ除外していないリクエストログで原因を調べられるように）。URL・シークレットは変数にだけ入れて表示しない。記録は件数・ステータス・真偽だけ。
+
+1. PR の `ci.yml` の `terraform-plan` の要約が `update` 1 件（`google_cloud_run_v2_service.tvad`）だけ → マージ
+2. `deploy.yml` の plan が `update` 1 件 → **Environment `prod` の承認**（ユーザーの明示承認）→ ビルド・push・apply・再 plan 差分 0
+3. **A**（手元 = TradingView の 4 つ以外の IP から。シークレットは送らない）:
+
+   ```bash
+   R=asia-northeast1
+   URL=$(gcloud run services describe tvad --region="$R" --format='value(status.url)')   # 表示しない
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST "$URL/webhook" -d '{"message":"test"}'                                   # 403
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST "$URL/webhook" -H 'X-Forwarded-For: 52.89.214.238' -d '{"message":"test"}' # 403（先頭の偽装が効かない）
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST "$URL/webhook" -H 'X-Forwarded-For: 203.0.113.9' -H 'X-Forwarded-For: 52.89.214.238' -d '{"message":"test"}' # 403（2 行のヘッダは拒否）
+   curl -s -o /dev/null -w '%{http_code}\n' "$URL/health"                                                                     # 200
+   # 環境変数が 4 つ（シークレットの参照 3 つ + 平文の ALLOWED_SOURCE_IPS が既定の値）。すべて true
+   gcloud run services describe tvad --region="$R" --format=json | jq '.spec.template.spec.containers[0].env as $e | {
+     env4: (($e | length) == 4),
+     secrets3: (([$e[] | select(.valueFrom.secretKeyRef != null and .value == null) | .name] | sort) == ["LINE_CHANNEL_ACCESS_TOKEN", "LINE_TO", "WEBHOOK_SECRET"]),
+     allowed_source_ips: ([$e[] | select(.value != null) | {name, value}] == [{name: "ALLOWED_SOURCE_IPS", value: "52.89.214.238,34.212.75.30,54.218.53.128,52.32.178.7"}])}'
+   unset URL
+   ```
+
+4. **D**（A の直後に。所有者が行う。実際の LINE に 1 通届く）: 「通し確認」の B と同じく TradingView のテストのアラートを 1 通送り、Webhook status が成功・その時刻のリクエストログの POST が `200`・`dispatched` が 1 件で全チャネル `ok: true`・LINE に届くことを確かめる（= `X-Forwarded-For` の末尾が TradingView の送信元で、許可リストが TradingView を通す。`docs/design.md`「送信元 IP の許可リスト」の未確認の点）。確かめたら設計書の未確認の点を事実に書き換える PR を出す
+   - **403 なら即切り戻す**: 「切り戻し」の「急ぐとき」で前のリビジョン（`ALLOWED_SOURCE_IPS` を持たない）へ traffic を移し、続けて `allowed_source_ips = []` の PR を `deploy.yml` で反映する。その間の TradingView のアラートは再送されない。原因は、そのリクエストログの `httpRequest.remoteIp` が許可リストに入っているかの真偽だけで見る（値は記録しない）:
+
+     ```bash
+     F='resource.type="cloud_run_revision" AND resource.labels.service_name="tvad"'
+     gcloud logging read "$F AND log_id(\"run.googleapis.com/requests\") AND httpRequest.status=403" --freshness=30m --format=json \
+       | jq '[.[].httpRequest.remoteIp | IN("52.89.214.238", "34.212.75.30", "54.218.53.128", "52.32.178.7")]'
+     ```
+
+5. A・D が通ったら **bootstrap の apply**（ユーザーの明示承認・所有者の手元）: bootstrap の「1. 作業前の記録」の `W` と `default-sink.before.json` だけを取り、「3. init」→「4. plan と要約の確認」→「5. apply と差分 0 の確認」。plan の目安は `create` 1 件（`google_logging_project_exclusion.tvad_rejected`）・ほかは `no-op`（それ以外があれば apply しない）。apply の直後の再 plan が差分 0（API がフィルタを正規化して返すと永続差分になる。出たら filter の書き方を API の返す形に合わせる PR）
+6. **C**: bootstrap の「6. 事後の確認」の `default_sink_check`（すべて true）
+7. **B**: A の 3 回をもう一度送り、2 分以上待ってから（すべて期待の件数）:
+
+   ```bash
+   F='resource.type="cloud_run_revision" AND resource.labels.service_name="tvad"'
+   REQ="$F AND log_id(\"run.googleapis.com/requests\")"
+   START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   # （ここで 3. の curl の 3 行を送る）
+   sleep 150
+   gcloud logging read "$REQ AND (httpRequest.status=401 OR httpRequest.status=403) AND timestamp>=\"$START\"" --format='value(timestamp)' | wc -l   # 0
+   gcloud logging read "$F AND jsonPayload.msg=\"forbidden\" AND timestamp>=\"$START\"" --format='value(timestamp)' | wc -l                            # 0
+   gcloud logging read "$REQ AND httpRequest.status=200 AND timestamp>=\"$START\"" --format='value(timestamp)' | wc -l                                 # 1 以上（/health。ログ自体は届いている）
+   ```
+
+   （任意）Cloud Monitoring の Metrics Explorer で `run.googleapis.com/request_count` を `service_name=tvad`・`response_code=403` で絞り、同じ範囲で 2 以上（弾いた件数が指標で見える）。終わったら `rm -rf "$W"`
+
+切り戻し: アプリは `allowed_source_ips = []` の PR（急ぐときは前のリビジョンへ traffic）。除外は「bootstrap の切り戻し・撤去」の「ログの除外を外す」。
+
+調査のとき（TradingView の送信元 IP が変わった疑いなど、弾いたリクエストの送信元 IP を見たいとき）: 除外は弾いたリクエストのリクエストログ（`httpRequest.remoteIp` を含む）を保存しないので、そのままでは送信元が分からない。所有者の承認の後、一時的に `gcloud logging sinks update _Default --update-exclusion=name=<除外の名前>,disabled=true`（または Terraform で `disabled = true` の PR）で止めて調べ、終わったら戻す（止めている間は弾いたリクエストのログが課金の対象になる）。
 
 ### 更新
 

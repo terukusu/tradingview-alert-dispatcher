@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # .github/scripts/tf-iam-decl-check.sh のテスト（ci.yml の check で回す。手元でもそのまま動く）。
 # infra/prod・infra/bootstrap の *.tf を一時ディレクトリ（名前は prod / bootstrap などにする）に写し、
-# IAM のリソースや module を足したときに NG（exit 1）になることを確かめる。
+# IAM のリソース・ログの設定のリソース（google_logging_*）や module を足したときに NG（exit 1）になることを確かめる。
 #
 #   tf-iam-decl-check.test.sh
 set -euo pipefail
@@ -36,7 +36,9 @@ run() {
 }
 
 run 0 'bootstrap（既定の一覧 8 件）' 'ok: IAM のリソースの宣言 8 件' "$root/infra/bootstrap"
+run 0 'bootstrap（ログの設定 1 件）' 'ok: ログの設定のリソースの宣言 1 件' "$root/infra/bootstrap"
 run 0 'prod（0 件）' 'ok: IAM のリソースの宣言 0 件' "$root/infra/prod"
+run 0 'prod（ログの設定 0 件）' 'ok: ログの設定のリソースの宣言 0 件' "$root/infra/prod"
 
 d=$(copy infra/prod prod)
 run 0 'prod の写し（0 件）' 'ok: IAM のリソースの宣言 0 件' "$d"
@@ -56,6 +58,22 @@ run 1 'prod に module を足す' 'NG:' "$d"
 d=$(copy infra/bootstrap bootstrap)
 printf '\nresource "google_project_iam_member" "extra" {}\n' >> "$d/iam.tf"
 run 1 'bootstrap に別の名前の付与を足す' 'NG:' "$d"
+
+d=$(copy infra/bootstrap bootstrap)
+printf '\nresource "google_logging_project_sink" "default" {}\n' >> "$d/logging.tf"
+run 1 'bootstrap に google_logging_project_sink を足す' 'NG:' "$d"
+
+d=$(copy infra/bootstrap bootstrap)
+printf '\nresource "google_logging_project_exclusion" "extra" {}\n' >> "$d/logging.tf"
+run 1 'bootstrap に 2 つ目の google_logging_project_exclusion を足す' 'NG:' "$d"
+
+d=$(copy infra/bootstrap bootstrap)
+rm "$d/logging.tf"
+run 1 'bootstrap からログの除外を消す' 'NG:' "$d"
+
+d=$(copy infra/prod prod)
+printf '\nresource "google_logging_project_exclusion" "x" {}\n' >> "$d/run.tf"
+run 1 'prod に google_logging_project_exclusion を足す' 'NG:' "$d"
 
 d=$(copy infra/prod staging)
 run 1 '期待の一覧が無いディレクトリ' 'NG:' "$d"
