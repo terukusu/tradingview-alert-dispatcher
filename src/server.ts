@@ -4,6 +4,7 @@ import { extractSecret, parseAlert } from './alert.ts';
 import { loadConfig } from './config.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { createNotifier } from './notifiers/index.ts';
+import { sourceIp } from './source-ip.ts';
 import type { Alert, DispatchResult } from './types.ts';
 
 /** 受け付ける本文の上限（TradingView のアラートのメッセージは数 KB） */
@@ -15,6 +16,8 @@ export interface AppOptions {
   /** 送信結果の受け口（既定は構造化ログ）。テストで差し替える */
   onDispatched?: (alert: Alert, results: DispatchResult[]) => void;
   now?: () => Date;
+  /** 送信元 IP の許可リスト（IPv4 の完全一致）。省略・空なら送信元 IP で制限しない */
+  allowedSourceIps?: readonly string[];
 }
 
 /**
@@ -32,13 +35,16 @@ export interface App {
 /**
  * - `POST /webhook`（`?key=<WEBHOOK_SECRET>` か本文の secret で認証。壊れた JSON も `"secret": "…"` の形を読む）: 受理したら 200 を即返し、送信は裏で行う
  *   （TradingView は応答を 3 秒しか待たない）
- * - `GET /health`: 200 `ok`
+ * - `GET /health`: 200 `ok`（許可リストで制限しない）
+ * - 許可リスト（`allowedSourceIps`）が空でなければ、`GET /health` 以外は送信元 IP（X-Forwarded-For の末尾、
+ *   無ければ接続元）が許可リストに無いものを本文を読む前・認証の前に 403 `forbidden` で退ける（ログに IP を出さない）
  *
  * 処理中のリクエスト（本文の読み込みから裏の配信・onDispatched まで）を追跡し、`shutdown` で待つ。
  */
 export function createApp(options: AppOptions): App {
   const now = options.now ?? (() => new Date());
   const onDispatched = options.onDispatched ?? logResults;
+  const allowed = new Set(options.allowedSourceIps ?? []);
   const inflight = new Set<Promise<void>>();
   let shuttingDown: Promise<{ remaining: number }> | undefined;
 
@@ -87,6 +93,14 @@ export function createApp(options: AppOptions): App {
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://localhost');
     if (url.pathname === '/health' && req.method === 'GET') return send(res, 200, 'ok');
+    if (allowed.size > 0) {
+      const ip = sourceIp(req.headersDistinct['x-forwarded-for'], req.socket.remoteAddress);
+      if (ip === undefined || !allowed.has(ip)) {
+        // 本文は読まない（読まれていない本文は応答の後に Node が読み捨てる）。IP は出さない
+        log('warn', { msg: 'forbidden' });
+        return send(res, 403, 'forbidden');
+      }
+    }
     if (url.pathname !== '/webhook') return send(res, 404, 'not found');
     if (req.method !== 'POST') return send(res, 405, 'method not allowed');
 
@@ -152,7 +166,11 @@ function main(): void {
   const config = loadConfig(process.env);
   const notifiers = config.channels.map((c) => createNotifier(c, { env: process.env }));
   const dispatcher = new Dispatcher(notifiers, config.defaultChannels);
-  const app = createApp({ webhookSecret: config.webhookSecret, dispatcher });
+  const app = createApp({
+    webhookSecret: config.webhookSecret,
+    dispatcher,
+    allowedSourceIps: config.allowedSourceIps,
+  });
   // Cloud Run は 0.0.0.0 の PORT に届ける
   app.server.listen(config.port, '0.0.0.0', () => {
     log('info', { msg: 'listening', port: config.port, channels: notifiers.map((n) => n.id) });

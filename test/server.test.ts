@@ -18,6 +18,7 @@ afterEach(() => {
 async function start(
   notifier?: Notifier,
   onDispatched: AppOptions['onDispatched'] | null = undefined,
+  extra: Partial<Pick<AppOptions, 'allowedSourceIps'>> = {},
 ) {
   const sent: Alert[] = [];
   const n: Notifier = notifier ?? {
@@ -34,7 +35,7 @@ async function start(
   if (onDispatched !== null) {
     options.onDispatched = onDispatched ?? ((_a, results) => resolveDone(results));
   }
-  app = createApp(options);
+  app = createApp({ ...options, ...extra });
   const { server } = app;
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -215,6 +216,170 @@ describe('ログ', () => {
     const { base } = await start();
     expect((await fetch(`${base}/webhook`, { method: 'POST', body: 'x' })).status).toBe(401);
     expect(logLines(spy)).toContainEqual({ severity: 'WARNING', msg: 'unauthorized' });
+  });
+});
+
+// 値は文書用の架空の IP（RFC 5737・RFC 3849）
+describe('送信元 IP の許可リスト', () => {
+  const ALLOWED = '192.0.2.1';
+  const ATTACKER = '203.0.113.9';
+  const allow = { allowedSourceIps: [ALLOWED] };
+  const post = (base: string, xff: string | undefined, query = `?key=${SECRET}`, body = 'hello') =>
+    fetch(`${base}/webhook${query}`, {
+      method: 'POST',
+      body,
+      headers: xff === undefined ? {} : { 'X-Forwarded-For': xff },
+    });
+
+  it('許可リスト外の送信元 IP は正しいシークレットでも 403 で LINE に送らない', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    let dispatched = 0;
+    const { app, base, sent } = await start(undefined, () => void dispatched++, allow);
+    const res = await post(base, ATTACKER);
+    expect(res.status).toBe(403);
+    expect(await res.text()).toBe('forbidden');
+    await app.shutdown();
+    expect(sent).toHaveLength(0);
+    expect(dispatched).toBe(0);
+  });
+
+  it('許可リスト内の送信元 IP は従来どおり 200 で送る', async () => {
+    const { base, sent, done } = await start(undefined, undefined, allow);
+    const res = await post(base, ALLOWED);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('accepted');
+    await done;
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.message).toBe('hello');
+  });
+
+  it('許可リスト内の送信元 IP でもシークレット違いは 401', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { app, base, sent } = await start(undefined, undefined, allow);
+    const res = await post(base, ALLOWED, '?key=wrong');
+    expect(res.status).toBe(401);
+    expect(await res.text()).toBe('unauthorized');
+    expect((await post(base, ALLOWED, '')).status).toBe(401);
+    await app.shutdown();
+    expect(sent).toHaveLength(0);
+  });
+
+  it('X-Forwarded-For の先頭の偽装は無視し末尾の値で判定する', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { base, sent, done } = await start(undefined, undefined, allow);
+    expect((await post(base, `${ALLOWED}, ${ATTACKER}`)).status).toBe(403);
+    expect((await post(base, `${ATTACKER}, ${ALLOWED}`)).status).toBe(200);
+    await done;
+    expect(sent).toHaveLength(1);
+  });
+
+  it('X-Forwarded-For の末尾が空なら 403', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { app, base, sent } = await start(undefined, undefined, allow);
+    for (const xff of [`${ALLOWED},`, `${ALLOWED}, `, '']) {
+      expect((await post(base, xff)).status).toBe(403);
+    }
+    await app.shutdown();
+    expect(sent).toHaveLength(0);
+  });
+
+  it('X-Forwarded-For が 2 行で届いたら、末尾が許可リストの IP でも 403', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { app, base, sent } = await start(undefined, undefined, allow);
+    const { port } = new URL(base);
+    // fetch はヘッダを 1 行にまとめるので、生の HTTP で 2 行のヘッダを送る
+    const socket = connect(Number(port), '127.0.0.1');
+    await new Promise((r) => socket.once('connect', r));
+    let received = '';
+    socket.setEncoding('utf8');
+    socket.on('data', (d: string) => {
+      received += d;
+    });
+    const closed = new Promise((r) => socket.once('close', r));
+    socket.end(
+      `POST /webhook?key=${SECRET} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n` +
+        `X-Forwarded-For: ${ATTACKER}\r\nX-Forwarded-For: ${ALLOWED}\r\n` +
+        'Content-Length: 5\r\n\r\nhello',
+    );
+    await closed;
+    expect(received).toMatch(/^HTTP\/1\.1 403 /);
+    await app.shutdown();
+    expect(sent).toHaveLength(0);
+  });
+
+  it('X-Forwarded-For が無いときは接続元のアドレスで判定する', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const a = await start(undefined, undefined, { allowedSourceIps: ['127.0.0.1'] });
+    expect((await post(a.base, undefined)).status).toBe(200);
+    await a.done;
+    expect(a.sent).toHaveLength(1);
+    a.app.server.close();
+    a.app.server.closeAllConnections();
+
+    const b = await start(undefined, undefined, allow);
+    expect((await post(b.base, undefined)).status).toBe(403);
+    await b.app.shutdown();
+    expect(b.sent).toHaveLength(0);
+  });
+
+  it('IPv6 の送信元は 403', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { app, base, sent } = await start(undefined, undefined, allow);
+    expect((await post(base, '2001:db8::1')).status).toBe(403);
+    await app.shutdown();
+    expect(sent).toHaveLength(0);
+  });
+
+  it('許可リストが空なら送信元 IP で制限しない', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { base, sent, done } = await start(undefined, undefined, { allowedSourceIps: [] });
+    expect((await post(base, ATTACKER)).status).toBe(200);
+    await done;
+    expect(sent).toHaveLength(1);
+    expect((await post(base, ATTACKER, '')).status).toBe(401);
+  });
+
+  it('GET /health は許可リスト外の送信元 IP でも 200', async () => {
+    const { base } = await start(undefined, undefined, allow);
+    const res = await fetch(`${base}/health`, { headers: { 'X-Forwarded-For': ATTACKER } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('ok');
+  });
+
+  it('許可リスト外の送信元 IP は本文を読む前に 403', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { app, base, sent } = await start(undefined, undefined, allow);
+    const res = await post(base, ATTACKER, `?key=${SECRET}`, 'a'.repeat(MAX_BODY_BYTES + 1));
+    expect(res.status).toBe(403);
+    expect(await res.text()).toBe('forbidden');
+    await app.shutdown();
+    expect(sent).toHaveLength(0);
+  });
+
+  it('許可リスト外の送信元 IP はほかのパス・メソッドも 403', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { base } = await start(undefined, undefined, allow);
+    const headers = { 'X-Forwarded-For': ATTACKER };
+    expect((await fetch(`${base}/webhook`, { headers })).status).toBe(403);
+    expect((await fetch(`${base}/other`, { method: 'POST', body: 'x', headers })).status).toBe(403);
+    expect((await fetch(`${base}/health`, { method: 'POST', body: 'x', headers })).status).toBe(
+      403,
+    );
+  });
+
+  it('forbidden のログは severity WARNING で送信元 IP・本文・シークレットを出さない', async () => {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { app, base } = await start(undefined, undefined, allow);
+    const body = JSON.stringify({ secret: SECRET, title: FAKE_TITLE, message: 'price 123.45' });
+    expect((await post(base, ATTACKER, `?key=${SECRET}`, body)).status).toBe(403);
+    await app.shutdown();
+    const lines = logLines(spy);
+    expect(lines).toContainEqual({ severity: 'WARNING', msg: 'forbidden' });
+    for (const call of spy.mock.calls) {
+      for (const v of [ATTACKER, FAKE_TITLE, '123.45', SECRET]) {
+        expect(String(call[0])).not.toContain(v);
+      }
+    }
   });
 });
 

@@ -39,7 +39,38 @@ describe('loadConfig', () => {
       webhookSecret: SECRET,
       channels: [{ id: 'a', type: 'line', tokenEnv: 'T_A' }],
       defaultChannels: ['a'],
+      allowedSourceIps: [],
     });
+  });
+
+  // 値は文書用の架空の IP（RFC 5737・RFC 3849）
+  it('ALLOWED_SOURCE_IPS をカンマ区切りで読み前後の空白と空の要素を除く', () => {
+    const c = loadConfig({
+      WEBHOOK_SECRET: SECRET,
+      CONFIG_PATH: undefined,
+      ALLOWED_SOURCE_IPS: ' 192.0.2.1 ,,198.51.100.7, ',
+    });
+    expect(c.allowedSourceIps).toEqual(['192.0.2.1', '198.51.100.7']);
+  });
+
+  it('ALLOWED_SOURCE_IPS が未設定・空なら許可リストは空', () => {
+    for (const v of [undefined, '', ' , ']) {
+      const c = loadConfig({
+        WEBHOOK_SECRET: SECRET,
+        CONFIG_PATH: undefined,
+        ALLOWED_SOURCE_IPS: v,
+      });
+      expect(c.allowedSourceIps).toEqual([]);
+    }
+  });
+
+  it('ALLOWED_SOURCE_IPS に IPv4 でない値があれば起動時に失敗する', () => {
+    for (const v of ['2001:db8::1', '192.0.2.0/24', 'example.com', '256.0.0.1']) {
+      const env = { WEBHOOK_SECRET: SECRET, CONFIG_PATH: undefined, ALLOWED_SOURCE_IPS: v };
+      expect(() => loadConfig(env)).toThrow('ALLOWED_SOURCE_IPS');
+      // 値そのものはメッセージに出さない
+      expect(() => loadConfig(env)).not.toThrow(v);
+    }
   });
 });
 

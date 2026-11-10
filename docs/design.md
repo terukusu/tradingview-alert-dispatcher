@@ -47,18 +47,27 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 
 ### 送信元 IP の許可リスト
 - 状態: 決定
-- 決定: 置かない
-- 理由: 共有シークレット（定数時間で比較）と最大インスタンス数の上限で足りる。送信元 IP の変更に追従する保守が要らない
-- 退けた案: アプリで `X-Forwarded-For` を見る（別 Issue が要り、保守が増える）。ロードバランサ + Cloud Armor（EPIC のスコープ外）
-- 再検討の条件: 不正なリクエスト（`unauthorized` のログ）が目立って増えたとき。TradingView の送信元 IPv4 は 4 つの固定とされているが、将来も変わらない保証はない
-- 出典: https://www.tradingview.com/support/solutions/43000529348-about-webhooks/
+- 決定（#16。オーナー判断）: 置く。環境変数 `ALLOWED_SOURCE_IPS`（カンマ区切りの IPv4。前後の空白・空の要素は除く）が空でなければ、`GET /health` 以外の **すべてのパス・メソッド** で、送信元 IP が一覧に無いリクエストを **本文を読む前・認証より前に** 403（本文 `forbidden`）で退ける。許可された送信元からの動き（認証・401・413・400・200 と裏の配信）は変えない。`GET /health` は制限しない（200 `ok` のまま。中身を返さない）
+- 送信元の取り方（`src/source-ip.ts`。純関数）: `X-Forwarded-For` があれば **末尾（右端）の要素**（`,` で分けて前後の空白を除いた最後の要素。空なら不一致で、接続元には戻らない）。ヘッダが無ければ接続元のアドレス（`::ffff:` の IPv4 射影は IPv4 に直す）。比較は文字列の完全一致（ポート付き・IPv6 は一致しない）。許可リストは IPv4 だけ（TradingView は IPv6 非対応）。IPv4 でない要素（IPv6・CIDR・ホスト名）があれば起動時に失敗する（メッセージに値を出さない）
+- 複数行のヘッダ（#16 のレビュー）: `X-Forwarded-For` が 2 行以上で届いたら拒否する（403）。Node の `req.headers` は複数行をカンマでつなぐので、前段のフロントエンドが行をどう扱うかによっては末尾が相手の書いた値になりうる。行ごとの配列（`req.headersDistinct`）で数え、1 行のときだけ末尾を見る
+- 根拠（末尾を見る）: Google のフロントエンドは、届いた `X-Forwarded-For` をそのまま残して後ろに付け足し、前の値を検証しない（外部 HTTPS ロードバランサの記載）。クライアントが前に偽の値を入れても、最後の要素はフロントエンドが付けた値になる
+- 未確認: Cloud Run の `run.app` への直接のリクエストで、フロントエンドが末尾に付けるのが「クライアントの IP 1 つ」か、ロードバランサと同じ「クライアントの IP, フロントエンドの IP」の 2 つかは公式ドキュメントに記載が無い（コンテナ契約に `X-Forwarded-For` の記載なし）。利用者の観測（公式ではない）は「末尾の 1 つ」。デプロイの後に TradingView のテストのアラートが 200 になることで確かめる（`infra/README.md`「送信元 IP の許可リストとログの除外（#16）」の D）。確かめたらここに書く
+- 前提: Google のフロントエンド（Cloud Run）の後ろでだけ効く。フロントエンドの無い場所に直接公開すると `X-Forwarded-For` の全体を相手が決められる（README・`.env.example` に書いた）
+- 既定は空（= 制限なし）: clone して使う人の環境・手元の開発（`npm start` + `curl localhost`）・`.github/scripts/image-check.sh`（未認証の POST が 401）が今のまま動く（後方互換）。既定を TradingView の 4 つにすると、手元からの `curl` が全部 403 になり、無効にする特別な値が要る
+- 本番の値: `infra/prod` の変数 `allowed_source_ips`（`list(string)`、既定は TradingView の 4 つ、要素は IPv4 の検査）。空でなければ Cloud Run の平文の環境変数 `ALLOWED_SOURCE_IPS` として渡し、空なら置かない（「シークレットの置き場」）
+- 切り戻し: `allowed_source_ips = []` の PR を `deploy.yml` で反映。急ぐときは前のリビジョン（`ALLOWED_SOURCE_IPS` を持たない）へ traffic を移す（`infra/README.md`「切り戻し」）
+- ログ: 403 のたびに `msg=forbidden`（`WARNING`）の 1 行だけ。**送信元 IP は出さない**（本文・シークレットも出さない）。根拠: (1) この行は「弾いたリクエストのログ」の除外で保存しない、(2) 攻撃元の IP が分かっても Cloud Run 単体では遮断できず使い道が無い、(3) 弾いた件数は Cloud Monitoring の指標 `run.googleapis.com/request_count`（ラベル `response_code`）で見える
+- 退けた案: 置かない（旧決定。未認証の大量のリクエストが 401 のリクエストログ・`unauthorized` の行として残り続ける）。`X-Forwarded-For` の先頭を見る（相手が偽装できる）。アプリの既定を TradingView の 4 つにする（上の後方互換）。値を Secret Manager に置く（公開の値で秘密ではなく、bootstrap の付与が増える）。ロードバランサ + Cloud Armor（届く前に弾けるが、スコープ外のまま）。CIDR・IPv6・自動追従（スコープ外）
+- 再検討の条件: TradingView の送信元 IPv4 が変わったとき（公式ページの変更は手で `allowed_source_ips` を直す）
+- 出典: https://www.tradingview.com/support/solutions/43000529348-about-webhooks/ 、https://docs.cloud.google.com/load-balancing/docs/https 、https://docs.cloud.google.com/run/docs/container-contract 、https://docs.cloud.google.com/functions/docs/reference/headers 、利用者の観測（非公式）https://discuss.google.dev/t/cloud-run-which-client-ip-can-i-safely-use-for-rate-limiting/409611 、https://nodejs.org/api/net.html#netisipv4input
 
 ### 乱用への備え
 - 状態: 決定
-- 決定: 本文の上限 64 KiB（実装済み。超えたら 413）、最大インスタンス数 **2**（`infra/prod` の変数 `max_instance_count`。検査は 1〜5 の整数）、認証に失敗したら 401 を返して配信しない（実装済み）
+- 決定: 本文の上限 64 KiB（実装済み。超えたら 413）、最大インスタンス数 **2**（`infra/prod` の変数 `max_instance_count`。検査は 1〜5 の整数）、認証に失敗したら 401 を返して配信しない（実装済み）、送信元 IP の許可リスト（本番は TradingView の 4 つ以外を本文の前に 403。「送信元 IP の許可リスト」）、弾いたリクエストのログを保存しない（「弾いたリクエストのログ」）
 - 理由: 未認証で呼べる受け口なので、費用と送信数が際限なく増えるのを防ぐ
 - 最大 2 の根拠: アラートは低頻度で、1 リクエストは即応答（送信は応答の後、8 秒以内）。1 インスタンスの同時実行は既定の 80 なので 2 台で 160 同時。instance-based billing は起動中のインスタンスすべてに課金されるので、乱用されたときの費用の上限を 2 台分に抑える。1 ではなく 2 にするのは、1 台の停止（リビジョンの切り替え・SIGTERM の 10 秒）と重なったときの余裕。検査の上限 5 は「小さく保つ」の歯止め（超えるなら設計を見直す）
 - 残るリスク: 160 を超える同時リクエストは Cloud Run が 429 を返し、TradingView は再送しない（取りこぼす）。この規模では起きない前提
+- 残るリスク（#16）: 許可リストの後も、`/health` への大量のリクエストは 200 でリクエストログに残る。除外はログの書き込みの API の割り当て（`entries.write`）を減らさない。許可された 4 つの IP（TradingView の共有の送信元）からの不正なリクエストは今までどおり 401 で、`unauthorized` の行が残る。Cloud Run の 429 などコンテナに届かないリクエストのログは対象外
 - 退けた案: アプリにレート制限を入れる（インスタンス間で共有できず、この規模では over-engineering）
 
 ## 送信のタイミング
@@ -102,6 +111,7 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - 決定: Secret Manager に置き、Cloud Run の環境変数として渡す（`secretKeyRef`）。対象は `WEBHOOK_SECRET`・`LINE_CHANNEL_ACCESS_TOKEN`・`LINE_TO`（送り先 ID は秘密ではないが、リポジトリと Terraform の state に置かない値）。実行用の SA にはシークレット単位の `roles/secretmanager.secretAccessor` だけを付ける。値の投入は所有者が手元で行い、Terraform に値を持たせない（state に載せない）。本番では `CONFIG_PATH` の JSON（複数チャネル）を使わず、環境変数だけの LINE の 1 チャネルで始める
 - 仕様: シークレットはインスタンスの起動前に解決され、取れなければインスタンスは起動しない
 - 理由: 平文の環境変数や state に値が残らない。権限をシークレット単位に絞れる
+- 平文の環境変数（#16）: 公開の値の `ALLOWED_SOURCE_IPS`（TradingView の送信元。秘密ではない）だけを平文で置く。秘密の値は Secret Manager の参照だけのまま。Secret Manager に置くと bootstrap の入れ物と実行用 SA の付与が増える。`infra/prod/tests/prod.tftest.hcl` で「平文の value を持つのは `ALLOWED_SOURCE_IPS` だけ」を固定する
 - 退けた案: 平文の環境変数（Cloud Run の設定に値が見える）。Terraform で値を持つ（state に載る）。ボリュームとしてマウント（いまのコードは環境変数を読むので変更が要る）
 - 出典: https://docs.cloud.google.com/run/docs/configuring/services/secrets
 
@@ -160,7 +170,7 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 
 - bootstrap の state のバケットには CI の SA の付与を付けない（CI が bootstrap の state を読み書きできない）
 - plan SA は prod の state を読むだけ（`objectViewer`）なので、plan SA の plan（`deploy.yml` の plan job・`ci.yml` の `terraform-plan`）は `-lock=false` で行う（ロックのために書き込みの付与を増やさない）
-- 付与の宣言（種類と名前）は `.github/scripts/tf-iam-decl-check.sh` で固定する（CI の check）。`terraform test` は各リソースの中の件数しか見られないため。実際のプロジェクトの IAM の差分は apply の後に `infra/README.md` の手順で確かめる
+- 付与の宣言（種類と名前）は `.github/scripts/tf-iam-decl-check.sh` で固定する（CI の check）。`terraform test` は各リソースの中の件数しか見られないため。同じスクリプトでログの設定のリソース（`google_logging_*`）の宣言も固定する（bootstrap は除外 1 つ・prod は 0。#16）。実際のプロジェクトの IAM の差分は apply の後に `infra/README.md` の手順で確かめる
 - 理由: 実行用・apply・plan で権限を分け、シークレットを読めるのは実行用 SA だけにする。PR の plan は読み取りの SA で行い、書き込みは承認つきの Environment の job に限る
 - 退けた案: 1 つの SA で apply と plan を兼ねる（PR の job に書き込みの権限が渡る）。プロジェクト単位の `serviceAccountUser`・`secretAccessor`（ほかの SA・シークレットに波及する）
 
@@ -223,12 +233,27 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 ### ログの項目
 - 状態: 決定
 - 決定: ログは 1 行 JSON（`severity` つき。Cloud Logging がそのまま読む）
-  - 出す: `msg=dispatched` とチャネルごとの `ok`・`elapsedMs`・`error`、認証失敗の `msg=unauthorized`（`WARNING`）、停止時の `msg=shutdown` / `msg=shutdown timeout` と残りの件数
+  - 出す: `msg=dispatched` とチャネルごとの `ok`・`elapsedMs`・`error`、認証失敗の `msg=unauthorized`（`WARNING`）、送信元 IP の許可リストで弾いた `msg=forbidden`（`WARNING`。IP なし。#16）、停止時の `msg=shutdown` / `msg=shutdown timeout` と残りの件数
   - 出さない: 本文・シークレット・トークン・送信先 ID・アラートの `title`
 - Cloud Run のリクエストログのクエリ文字列は、本番で `?key=` を使わない運用（「シークレットの渡し方」）で避ける
 - #5 で使う絞り込み: `jsonPayload.msg="dispatched"` の件数と、各チャネルの `ok` の値。認証失敗は `jsonPayload.msg="unauthorized"` の件数
 - 理由: `title` には銘柄が入りうるので、ログに残る。#5 でログを要約するときに混じりうる
 - 退けた案: `title` を出し続ける
+
+### 弾いたリクエストのログ
+- 状態: 決定
+- 決定（#16）: `_Default` シンクに除外を 1 つ足し、`tvad` の、リクエストログの 401・403 と、アプリの `forbidden` の行を保存しない（`infra/bootstrap/logging.tf` の `google_logging_project_exclusion.tvad_rejected`。名前 `tvad-rejected-requests`）。フィルタ（この形で固定。`infra/bootstrap/tests/bootstrap.tftest.hcl` で完全一致）:
+  ```
+  resource.type="cloud_run_revision" AND resource.labels.service_name="tvad" AND ((log_id("run.googleapis.com/requests") AND (httpRequest.status=401 OR httpRequest.status=403)) OR (log_id("run.googleapis.com/stdout") AND jsonPayload.msg="forbidden"))
+  ```
+- 対象: 同じプロジェクトのほかのサービスのログ・`tvad` のほかのログ（200 などのリクエストログ・`dispatched`・`unauthorized`・`listening` など）は残る
+- `unauthorized` を残す理由: 許可リストの後は、401 になるのは TradingView の送信元から来てシークレットが違うもの（アラートのメッセージの誤りなど）だけで、件数は TradingView の送り方で頭打ちになり、原因の調べに要る。401 のリクエストログは、許可リストを空にした（切り戻した）ときの備えとして除外に含める
+- 件数の見方: Cloud Monitoring の `run.googleapis.com/request_count`（`response_code`）。ログの除外と無関係で、Google Cloud の指標は無料
+- 追加型の除外を選ぶ理由: `google_logging_project_exclusion` はプロジェクトの `_Default` シンクに除外を 1 つ作るだけ。`google_logging_project_sink` で `_Default` を管理するとシンク全体を Terraform が持ち、ほかの除外・包含フィルタを書き換えうる（import も要る）。宣言は `tf-iam-decl-check.sh` で固定する（bootstrap は除外 1 つだけ・sink 0、prod は 0）
+- 置き場を `infra/bootstrap`（所有者が手元で apply）にする理由: 除外の作成には `logging.exclusions.create`（`roles/logging.configWriter` など）が要る。CI の apply SA に付けるとプロジェクトのすべてのシンク・除外を変えられる権限になり、「SA と権限」から外れる。所有者の権限で足り、IAM の付与は増えない
+- 注: 除外は Logging API が受け取った後に効く。書き込みの API の割り当て（`entries.write`）は減らない。この規模では問題にしない。除外していた間のログは、除外を消しても戻らない
+- 退けた案: `google_logging_project_sink` で `_Default` を管理する（上の理由）。`gcloud logging sinks update _Default --add-exclusion=…` の手作業（コードに残らず、テストで固定できない）。`unauthorized` も除外する（原因の調べに要る）。CI の apply SA に `roles/logging.configWriter` を付けて `infra/prod` に置く（権限が広い）
+- 出典: https://github.com/hashicorp/terraform-provider-google/blob/main/website/docs/r/logging_project_exclusion.html.markdown 、https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/projects.exclusions/create 、https://docs.cloud.google.com/kubernetes-engine/docs/how-to/exclude-logs 、https://docs.cloud.google.com/logging/docs/routing/overview 、https://cloud.google.com/products/observability/pricing 、https://docs.cloud.google.com/monitoring/api/metrics_gcp_p_z
 
 ## 後続 Issue への引き継ぎ
 
@@ -263,3 +288,5 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - https://developers.line.biz/en/reference/messaging-api/#status-codes
 - https://developers.line.biz/en/reference/messaging-api/#error-responses
 - https://developers.line.biz/en/docs/messaging-api/retrying-api-request/
+- https://docs.cloud.google.com/load-balancing/docs/https
+- https://docs.cloud.google.com/logging/docs/routing/overview

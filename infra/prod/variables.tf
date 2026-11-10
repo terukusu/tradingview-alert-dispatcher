@@ -50,3 +50,14 @@ variable "secret_version" {
     error_message = "secret_version は latest か正の整数。"
   }
 }
+
+variable "allowed_source_ips" {
+  description = "送信元 IP の許可リスト（IPv4。docs/design.md「送信元 IP の許可リスト」）。既定は TradingView の webhook の送信元（公開の値）。[] で環境変数を置かない = 制限なし（切り戻し）"
+  type        = list(string)
+  default     = ["52.89.214.238", "34.212.75.30", "54.218.53.128", "52.32.178.7"]
+
+  validation {
+    condition     = alltrue([for ip in var.allowed_source_ips : can(regex("^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$", ip))])
+    error_message = "allowed_source_ips は IPv4 だけ（CIDR・IPv6・ホスト名は不可）。"
+  }
+}
