@@ -39,7 +39,7 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 - 理由: Cloud Run のリクエストログにはクエリ文字列が残る（前提の観測）ので、`?key=` だとシークレットがリクエストログに載る。本文はアプリもログに出さない
 - 制約: 本番ではテキストのアラートは使えない（JSON が必須）
 - 退けた案: 本番も `?key=`（リクエストログにシークレットが載る）。本番で `?key=` を拒む設定をコードに足す（コードが増える。必要になれば別 Issue）
-- #5 の手順書と README の TradingView の例は JSON の `secret` で書く（README は JSON の `secret` の例にした）
+- 反映済み: README.md「TradingView のアラートの設定」と `infra/README.md`「通し確認」は JSON の `secret` で書いた（#5）
 
 ### 送信元 IP の許可リスト
 - 状態: 決定
@@ -67,13 +67,20 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
   - LINE 経路の送信全体の締め切りは 8 秒（試行 5 秒、再試行 2 回、待ち 0.5 秒・1 秒）
   - インスタンスの停止は SIGTERM から SIGKILL まで 10 秒
 - 理由: 既定の request-based billing はリクエストの処理中だけ CPU を割り当て、応答の後の処理（background activity）は CPU が止まるか大きく絞られるので、応答の後の送信が止まりうる。送ってから応答する方式では LINE の締め切り 8 秒が 3 秒に収まらず、同じ `X-Line-Retry-Key` での再試行を削る必要がある
-- 費用: instance-based billing はアイドル中のインスタンスにも課金される。料金の数値（単価・無料枠）は **未確認**。#5 の前に https://cloud.google.com/run/pricing で確かめる（この文書には数値を書かない）
+- 費用: instance-based billing はアイドル中のインスタンスにも課金される。料金の数値（単価・無料枠）は **未確認**。#5 の実測で最小インスタンス数 0 のままにしたので確かめていない。最小 1 を検討するときに https://cloud.google.com/run/pricing で確かめる（この文書には数値を書かない）
 - 退けた案: 応答の後に送る + request-based billing（いまの実装のままでは送信が止まりうるので、EPIC の終了条件 3 を満たせない）。送ってから応答する（LINE のタイムアウトと再試行を 3 秒の中に縮める必要があり、再試行の余地がほぼ無くなる）
 - 出典: https://docs.cloud.google.com/run/docs/configuring/billing-settings 、https://docs.cloud.google.com/run/docs/tips/general
 
 ### 最小インスタンス数
 - 状態: 決定
 - 決定: 0 で始める。#5 でコールドスタートを含む 10 回の応答がすべて 3 秒未満かを測り、超えたら 1 にするかを再判断する
+- 再判断（#5）: **0 のまま**。下の実測で 10 回すべてが 3 秒未満だった
+- 実測（2026-11-10、`infra/README.md`「通し確認」の A）: 前のリクエストから 38 分のアイドルの後、正しいシークレット・`channels` に設定に無い ID だけ（LINE に送らない）で 10 回（1 秒間隔で順に）
+  - 10 回とも 200。curl の `time_total` は 1 回目 0.82 秒（コールドスタート。新しいインスタンスの `listening` が 1 件）、2〜10 回目 0.09〜0.10 秒
+  - Cloud Run のリクエストログの `httpRequest.latency`: 10 件、最大 0.54 秒・最小 0.002 秒（起動待ちを含むかは公式ドキュメントに記載なし = 未確認。curl の `time_total` は外から見た往復で起動待ちを含む）
+  - `msg=dispatched` 10 件（すべて未知のチャネルの `ok: false`。LINE への送信 0）、`dispatched` 以外の ERROR 0 件
+  - 実際の LINE への送達（応答の後の送信が止まらないこと）は TradingView のテストのアラート 1 通で確かめる（`infra/README.md`「通し確認」の B）
+- 再検討の条件: 再測定（同じ手順）で 3 秒以上が出たとき、または TradingView の Webhook status にタイムアウトが出たとき
 - 理由: 費用を最小にし、まず実測する
 - 退けた案: 最初から 1（実測の前に常時の費用を払う）
 
@@ -97,8 +104,11 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
 ### シークレットの版
 - 状態: 決定
 - 決定: 版は Terraform の変数で指定し、既定は `latest`。ローテーションは新しいリビジョンを作ることで反映する、と手順に書く
-- 理由: 運用が簡単（値を更新するたびに apply しなくてよい）
-- 注: `latest` も起動時に解決され、取れなければ起動しない。#5 の手順に書く
+- 入れ替えの方法（#5 で決定。オーナー判断）: 所有者が新しい版を `gcloud secrets versions add` で足し、`infra/prod` の `secret_version` をその番号にする PR を `deploy.yml` で反映する（新しいリビジョンができる）。`gcloud run services update` は使わない（本番を変えるのは `deploy.yml` だけ）。`secret_version` は 3 つのシークレットに共通なので、ほかのシークレットにはいまの値の複製を足して番号をそろえる。手順は `infra/README.md`「シークレットの値の入れ替え」
+- 理由: 運用が簡単（値を更新するたびに apply しなくてよい）。入れ替えのときは番号にすることで、いつ切り替わるかを PR と承認で決められる
+- 注: 最初の入れ替えで版を番号にした後は、既定の `latest` は使われなくなる（変数の値が番号のままになる）。いまの変数は 3 つのシークレットに共通の 1 つなので、1 つだけ入れ替えるときもほかの 2 つの版をそろえる必要がある。シークレットごとに版を指定できるようにするのは #12
+- 注: `latest` も起動時（リビジョンの作成時ではなく、インスタンスの起動時）に解決され、取れなければ起動しない。`latest` のまま版を足すと、その後に起動したインスタンスだけが新しい値になり、動いているインスタンスと混在する（反映済み: `infra/README.md`「シークレットの値の入れ替え」）
+- 退けた案（入れ替え）: `gcloud run services update` で新しいリビジョンを作る（Terraform と食い違い、次の plan に update が出る）。`latest` のままインスタンスの入れ替わりを待つ（いつ切り替わるか決まらず、古い値と新しい値が混在する）
 - 退けた案: 常に版を固定する（Google の推奨だが、値を更新するたびに apply が要る）
 - 出典: https://docs.cloud.google.com/run/docs/configuring/services/secrets
 
@@ -228,13 +238,7 @@ TradingView のアラート（webhook）を受けて複数の経路（第一弾�
   - README の TradingView の例を JSON の `secret` にする
 - #3（bootstrap）: 反映済み。`infra/bootstrap` に WIF のプール・プロバイダ、SA 3 つ（「SA と権限」）、Artifact Registry、tfstate のバケット 2 つ、Secret Manager の入れ物 3 つ（値なし）。apply と値の投入は所有者が `infra/README.md` の手順で行う。apply の前に Environment `prod` を保護する（同 0. 前提）
 - #4（prod の Cloud Run・deploy.yml）: 反映済み。`infra/prod`（サービス `tvad`: `invoker_iam_disabled`・ingress `all`・instance-based billing・CPU 1・メモリ `512Mi`・最小 0・最大 2・`secretKeyRef` の版は変数で既定 `latest`・起動プローブは既定の TCP・`deletion_protection`・traffic は最新に 100%）、`.github/workflows/deploy.yml`（「デプロイの流れ（deploy.yml）」）、`ci.yml` の `terraform-plan`（PR の plan。`-lock=false`、`pull_request_target` を使わない）。手順は `infra/README.md`「prod（Cloud Run）」。デプロイの後に確かめる事実（plan SA の `roles/run.viewer` で plan が足りたか、不変 ID 入りの sub の形式が合っていたか）は、確かめたらここに書く
-- #5（通し確認・運用の手順）:
-  - コールドスタートを含む 10 回の応答がすべて 3 秒未満か、`msg=dispatched` が 10 件か
-  - 誤ったシークレットで 401 になるか（記録は `curl` のステータスだけ。URL は記録しない）
-  - LINE の無料枠の消費に注意する。`LINE_TO` を必須にする
-  - 料金の数値を確かめる
-  - TradingView のアラートのメッセージは JSON で書き、`secret` を入れる（本番ではテキストのアラートは使えない）
-  - シークレットの版は `latest` でも起動時に解決され、取れなければ起動しない。値を入れ替えたら新しいリビジョンを作って反映する（ローテーションの手順）
+- #5（通し確認・運用の手順）: 反映済み。README.md「TradingView のアラートの設定」（2 段階認証、URL とシークレットの取り出し、JSON の `secret`、本番ではテキストのアラートを使わない）と「運用」（ログの見方・失敗した経路・`unauthorized` の件数・LINE の無料枠・シークレットの入れ替え・切り戻し）、`infra/README.md`「通し確認」「シークレットの値の入れ替え」。10 回の応答と `dispatched` 10 件の実測と最小インスタンス数の再判断は「最小インスタンス数」、入れ替えの方法は「シークレットの版」。誤ったシークレットで 401 は #4 で確認済み。`LINE_TO` の必須は「broadcast と LINE の無料枠」と #4 の手順のまま。料金の数値は最小 0 のままにしたので確かめていない（「送信のタイミング」）。TradingView のテストのアラート 1 通での送達の確認は `infra/README.md`「通し確認」の B
 
 ## 出典
 
