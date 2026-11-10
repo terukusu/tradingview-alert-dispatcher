@@ -1,0 +1,243 @@
+name: deploy
+
+# 本番（infra/prod の Cloud Run）へのデプロイ。main への push ごとに plan し、差分があるときだけ
+# Environment prod の承認の後に apply する（docs/design.md「デプロイの流れ（deploy.yml）」・infra/README.md「prod（Cloud Run）」）。
+# リポジトリは public で Actions のログ・ジョブの要約は誰でも読める。plan / apply の全文・プロジェクト ID・番号・SA のメール・
+# URL を出さない（docs/design.md「公開リポジトリの CI のログ」）: terraform・gcloud・docker の出力はファイルに書き、
+# 失敗時だけ log-mask.sh filter を通した末尾を出す。要約に出すのはアドレスと操作・件数・タグ・digest の先頭だけ。
+# plan ファイルは artifact にしない（公開リポジトリの artifact は誰でも取れる）。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    # GCP_PROJECT_ID は secret（job の最初から自動で伏せられ、それを含む SA のメール・バケット名・AR のパスも伏せられる）
+    env:
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+      GCP_SA: ${{ vars.GCP_SA_TF_PLAN }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+      TF_IN_AUTOMATION: "1"
+    outputs:
+      changes: ${{ steps.plan.outputs.changes }}
+      ops_sha: ${{ steps.plan.outputs.ops_sha }}
+      exists: ${{ steps.image.outputs.exists }}
+    steps:
+      # clone して使う人のリポジトリ（設定なし）では何もしない（main への push を毎回失敗にしない）
+      - name: 設定の確認
+        id: cfg
+        run: |
+          missing=""
+          [ -n "$GCP_PROJECT_ID" ] || missing+=" secrets.GCP_PROJECT_ID"
+          [ -n "$GCP_WIF_PROVIDER" ] || missing+=" secrets.GCP_WIF_PROVIDER"
+          [ -n "$TF_STATE_BUCKET" ] || missing+=" vars.TF_STATE_BUCKET"
+          [ -n "$GCP_SA" ] || missing+=" vars.GCP_SA_TF_PLAN"
+          if [ -n "$missing" ]; then
+            echo "::notice::未設定（${missing# }）なので deploy をスキップする（infra/README.md「GitHub の設定」）"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.cfg.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+      - name: プロジェクト番号を伏せる
+        if: steps.cfg.outputs.enabled == 'true'
+        run: .github/scripts/log-mask.sh register
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        if: steps.cfg.outputs.enabled == 'true'
+        with:
+          terraform_version: 1.16.4
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        if: steps.cfg.outputs.enabled == 'true'
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_TF_PLAN }}
+      # Artifact Registry にタグがあれば digest、無ければタグの参照で plan する（push は承認の後の apply job）
+      - name: イメージの解決
+        id: image
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          .github/scripts/image.sh resolve > "$RUNNER_TEMP/image.env"
+          grep -E '^(tag|exists)=' "$RUNNER_TEMP/image.env" >> "$GITHUB_OUTPUT"
+          # image= はプロジェクト ID を含むので、ジョブの出力にせず環境変数で渡す
+          sed -n 's/^image=/TF_VAR_image=/p' "$RUNNER_TEMP/image.env" >> "$GITHUB_ENV"
+      # plan SA は state を読むだけ（objectViewer）なので -lock=false
+      - name: terraform plan（plan SA）
+        id: plan
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          TAG: ${{ steps.image.outputs.tag }}
+          EXISTS: ${{ steps.image.outputs.exists }}
+        run: |
+          if ! terraform -chdir=infra/prod init -input=false -no-color -backend-config="bucket=$TF_STATE_BUCKET" > "$RUNNER_TEMP/init.log" 2>&1; then
+            echo "::error::terraform init が失敗した（末尾をマスクして出す）"
+            tail -n 40 "$RUNNER_TEMP/init.log" | .github/scripts/log-mask.sh filter
+            exit 1
+          fi
+          rc=0
+          terraform -chdir=infra/prod plan -lock=false -input=false -no-color -detailed-exitcode -out=prod.tfplan > "$RUNNER_TEMP/plan.log" 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+            echo "::error::terraform plan が失敗した（exit $rc。末尾をマスクして出す）"
+            tail -n 40 "$RUNNER_TEMP/plan.log" | .github/scripts/log-mask.sh filter
+            exit 1
+          fi
+          ops=$(.github/scripts/tf-plan-summary.sh --ops infra/prod/prod.tfplan)
+          {
+            echo "### terraform plan（infra/prod）"
+            echo
+            echo "- イメージのタグ: \`$TAG\`（Artifact Registry に $([ "$EXISTS" = true ] && echo 'あり' || echo '未作成。承認の後の apply でビルドして push する')）"
+            echo
+            .github/scripts/tf-plan-summary.sh infra/prod/prod.tfplan
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$ops" ]; then echo "changes=true" >> "$GITHUB_OUTPUT"; else echo "changes=false" >> "$GITHUB_OUTPUT"; fi
+          # 承認した plan の「アドレスと操作」の指紋（apply の直前の plan と比べる）
+          echo "ops_sha=$(printf '%s\n' "$ops" | sha256sum | cut -c1-64)" >> "$GITHUB_OUTPUT"
+
+  apply:
+    needs: plan
+    # 差分が無ければ動かさない（承認待ちを作らない）
+    if: needs.plan.outputs.changes == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: prod
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+      TF_IN_AUTOMATION: "1"
+      GCP_REGION: asia-northeast1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: プロジェクト番号を伏せる
+        run: .github/scripts/log-mask.sh register
+      # イメージが無いときだけ、GCP の認証より前にビルドして検査する（ci.yml の check と同じ検査）
+      - name: イメージのビルド
+        if: needs.plan.outputs.exists != 'true'
+        run: docker build -t dispatcher:build .
+      - name: イメージの検査
+        if: needs.plan.outputs.exists != 'true'
+        run: .github/scripts/image-check.sh dispatcher:build
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.4
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_TF_APPLY }}
+      # push してから digest を引き直す。apply は digest（@sha256:）の参照だけ
+      - name: イメージの push と digest の解決
+        env:
+          BUILT: ${{ needs.plan.outputs.exists != 'true' }}
+        run: |
+          .github/scripts/image.sh resolve > "$RUNNER_TEMP/image.env"
+          if grep -qx 'exists=false' "$RUNNER_TEMP/image.env"; then
+            if [ "$BUILT" != true ]; then
+              echo "::error::plan の時点で Artifact Registry にあったイメージが無い（この job ではビルドしていない）"
+              exit 1
+            fi
+            ref=$(sed -n 's/^image=//p' "$RUNNER_TEMP/image.env")
+            if ! { gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet \
+                && docker tag dispatcher:build "$ref" \
+                && docker push --quiet "$ref"; } > "$RUNNER_TEMP/push.log" 2>&1; then
+              echo "::error::イメージの push が失敗した（末尾をマスクして出す）"
+              tail -n 40 "$RUNNER_TEMP/push.log" | .github/scripts/log-mask.sh filter
+              exit 1
+            fi
+            .github/scripts/image.sh resolve > "$RUNNER_TEMP/image.env"
+          fi
+          image=$(sed -n 's/^image=//p' "$RUNNER_TEMP/image.env")
+          if [[ $image != *@sha256:* ]]; then
+            echo "::error::イメージが digest の参照でない"
+            exit 1
+          fi
+          echo "TF_VAR_image=$image" >> "$GITHUB_ENV"
+          {
+            echo "### イメージ"
+            echo
+            echo "- タグ: \`$(sed -n 's/^tag=//p' "$RUNNER_TEMP/image.env")\`、digest: \`sha256:$(printf '%s' "${image##*@sha256:}" | cut -c1-12)…\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: terraform init
+        run: |
+          if ! terraform -chdir=infra/prod init -input=false -no-color -backend-config="bucket=$TF_STATE_BUCKET" > "$RUNNER_TEMP/init.log" 2>&1; then
+            echo "::error::terraform init が失敗した（末尾をマスクして出す）"
+            tail -n 40 "$RUNNER_TEMP/init.log" | .github/scripts/log-mask.sh filter
+            exit 1
+          fi
+      # 承認した plan（plan job）と同じ「アドレスと操作」のときだけ apply する（apply SA の権限は広い）。
+      # イメージの参照がタグ → digest に変わるのは同じアドレス・同じ操作なので一致する
+      - name: terraform apply（apply SA）
+        env:
+          APPROVED_OPS_SHA: ${{ needs.plan.outputs.ops_sha }}
+        run: |
+          [[ $TF_VAR_image == *@sha256:* ]] || { echo "::error::イメージが digest の参照でない"; exit 1; }
+          if ! terraform -chdir=infra/prod plan -input=false -no-color -out=prod.tfplan > "$RUNNER_TEMP/plan.log" 2>&1; then
+            echo "::error::terraform plan が失敗した（末尾をマスクして出す）"
+            tail -n 40 "$RUNNER_TEMP/plan.log" | .github/scripts/log-mask.sh filter
+            exit 1
+          fi
+          ops_sha=$(.github/scripts/tf-plan-summary.sh --ops infra/prod/prod.tfplan | sha256sum | cut -c1-64)
+          if [ "$ops_sha" != "$APPROVED_OPS_SHA" ]; then
+            {
+              echo "### apply を中止: 承認した plan と操作が違う"
+              echo
+              .github/scripts/tf-plan-summary.sh infra/prod/prod.tfplan
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::apply の直前の plan が承認した plan と違う（アドレスと操作）。apply しない"
+            exit 1
+          fi
+          if ! terraform -chdir=infra/prod apply -input=false -no-color prod.tfplan > "$RUNNER_TEMP/apply.log" 2>&1; then
+            echo "::error::terraform apply が失敗した（末尾をマスクして出す）"
+            tail -n 40 "$RUNNER_TEMP/apply.log" | .github/scripts/log-mask.sh filter
+            exit 1
+          fi
+          grep -E '^Apply complete!' "$RUNNER_TEMP/apply.log" | .github/scripts/log-mask.sh filter
+      # apply の直後の plan が差分 0 でなければ失敗（設定と API の既定の食い違いなどを毎回検出する）
+      - name: 再 plan（差分 0 の確認）
+        run: |
+          rc=0
+          terraform -chdir=infra/prod plan -input=false -no-color -detailed-exitcode -out=replan.tfplan > "$RUNNER_TEMP/replan.log" 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            printf '### 再 plan\n\n差分なし（No changes）\n' >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$rc" -eq 2 ]; then
+            {
+              echo "### 再 plan: 差分あり"
+              echo
+              .github/scripts/tf-plan-summary.sh infra/prod/replan.tfplan
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::apply の後の plan に差分がある（要約を見る）"
+            exit 1
+          else
+            echo "::error::再 plan が失敗した（exit $rc。末尾をマスクして出す）"
+            tail -n 40 "$RUNNER_TEMP/replan.log" | .github/scripts/log-mask.sh filter
+            exit 1
+          fi
